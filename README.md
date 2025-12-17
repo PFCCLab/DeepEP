@@ -17,7 +17,7 @@
 >
 > ```python
 > import paddle
-> paddle.compat.enable_torch_proxy(scope={"deep_ep"})  # Enable torch proxy before importing deep_ep
+> paddle.enable_compat(scope={"deep_ep"})  # Enable torch proxy before importing deep_ep
 > import deep_ep
 > # use deep_ep
 > ```

@@ -1,5 +1,5 @@
 import paddle
-paddle.compat.enable_torch_proxy()
+paddle.enable_compat()
 
 import argparse
 import os
