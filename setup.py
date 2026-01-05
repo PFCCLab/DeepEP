@@ -4,7 +4,7 @@ import setuptools
 import importlib
 
 from pathlib import Path
-from paddle.utils.cpp_extension import BuildExtension, CUDAExtension
+from paddle.utils.cpp_extension import BuildExtension, CUDAExtension, _get_cuda_arch_flags
 from paddle.utils.cpp_extension.extension_utils import (
     add_compile_flag,
 )
@@ -95,6 +95,7 @@ if __name__ == '__main__':
         'nvcc': nvcc_flags,
     }
     if len(nvcc_dlink) > 0:
+        nvcc_dlink = nvcc_dlink + _get_cuda_arch_flags()
         extra_compile_args['nvcc_dlink'] = nvcc_dlink
 
     # Summary
