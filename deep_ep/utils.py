@@ -39,6 +39,12 @@ class EventOverlap:
         assert self.event is not None
         self.event.current_stream_wait()
 
+    def calc_stream_wait(self, group_idx) -> None:
+        self.event.calc_stream_wait(group_idx)
+
+    def comm_stream_wait(self, group_idx) -> None:
+        self.event.comm_stream_wait(group_idx)
+
     def __enter__(self) -> Any:
         """
         Utility for overlapping and Python `with` syntax.
