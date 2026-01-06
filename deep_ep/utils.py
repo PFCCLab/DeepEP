@@ -6,6 +6,8 @@ from typing import Any, Optional, Tuple
 # noinspection PyUnresolvedReferences
 from deep_ep_cpp import EventHandle
 
+import paddle
+
 
 class EventOverlap:
     """
@@ -99,3 +101,9 @@ def check_nvlink_connections(group):
 
         # Close NVML
         pynvml.nvmlShutdown()
+
+
+def get_event_from_comm_stream(group_id: int) -> EventOverlap:
+    return EventOverlap(
+        event=paddle.base.core.get_event_handle_from_comm_stream(group_id)
+    )
