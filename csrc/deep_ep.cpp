@@ -496,7 +496,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            const Config& config,
                            std::optional<EventHandle>& previous_event,
                            bool async,
-                           bool allocate_on_comm_stream) {
+                           bool allocate_on_comm_stream,
+                           bool skip_x_record_stream) {
     bool cached_mode = cached_rank_prefix_matrix.has_value();
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
@@ -735,11 +736,16 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     std::optional<EventHandle> event;
     if (async) {
         event = EventHandle(comm_stream);
-        for (auto& t : {x,
-                        is_token_in_rank,
+        if (!skip_x_record_stream) {
+            for (auto& t : {x, recv_x}) {
+                t.record_stream(comm_stream);
+                if (allocate_on_comm_stream)
+                    t.record_stream(compute_stream);
+            }
+        }
+        for (auto& t : {is_token_in_rank,
                         rank_prefix_matrix,
                         channel_prefix_matrix,
-                        recv_x,
                         recv_src_idx,
                         recv_channel_prefix_matrix,
                         send_head}) {
@@ -796,7 +802,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     const Config& config,
     std::optional<EventHandle>& previous_event,
     bool async,
-    bool allocate_on_comm_stream) {
+    bool allocate_on_comm_stream,
+    bool skip_x_record_stream) {
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
     EP_HOST_ASSERT(src_idx.dim() == 1 and src_idx.is_contiguous() and src_idx.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(send_head.dim() == 2 and send_head.is_contiguous() and send_head.scalar_type() == torch::kInt32);
@@ -904,7 +911,12 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     std::optional<EventHandle> event;
     if (async) {
         event = EventHandle(comm_stream);
-        for (auto& t : {x, src_idx, send_head, rank_prefix_matrix, channel_prefix_matrix, recv_x}) {
+        if (!skip_x_record_stream) {
+            x.record_stream(comm_stream);
+            if (allocate_on_comm_stream)
+                x.record_stream(compute_stream);
+        }
+        for (auto& t : {src_idx, send_head, rank_prefix_matrix, channel_prefix_matrix, recv_x}) {
             t.record_stream(comm_stream);
             if (allocate_on_comm_stream)
                 t.record_stream(compute_stream);

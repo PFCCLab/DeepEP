@@ -191,7 +191,8 @@ public:
                        const Config& config,
                        std::optional<EventHandle>& previous_event,
                        bool async,
-                       bool allocate_on_comm_stream);
+                       bool allocate_on_comm_stream,
+                       bool skip_x_record_stream = false);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> intranode_combine(
         const torch::Tensor& x,
@@ -205,7 +206,8 @@ public:
         const Config& config,
         std::optional<EventHandle>& previous_event,
         bool async,
-        bool allocate_on_comm_stream);
+        bool allocate_on_comm_stream,
+        bool skip_x_record_stream = false);
 
     std::tuple<torch::Tensor,
                std::optional<torch::Tensor>,
