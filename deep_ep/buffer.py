@@ -332,7 +332,8 @@ class Buffer:
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                  allocate_on_comm_stream: bool = False,
                  skip_x_record_stream: bool = False) -> \
-                  Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
+                 Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
+                    Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
         Dispatch tokens to different ranks, both intranode and internode settings are supported.
         Intranode kernels require all the ranks should be visible via NVLink.
@@ -414,6 +415,8 @@ class Buffer:
                 previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                 allocate_on_comm_stream: bool = False,
                 skip_x_record_stream: bool = False) -> \
+                Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+
         """
         Combine (reduce) tokens (addition **without** weights) from different ranks, both intranode and internode
             settings are supported.
@@ -436,6 +439,7 @@ class Buffer:
             recv_topk_weights: the reduced top-k weights from its dispatch ranks.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
+
         # Default config
         config = self.get_combine_config(self.group_size) if config is None else config
 
