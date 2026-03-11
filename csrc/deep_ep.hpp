@@ -10,6 +10,7 @@
 #include <torch/types.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -85,7 +86,7 @@ private:
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
-    cudaStream_t comm_stream;
+    std::optional<at::cuda::CUDAStream> comm_stream;
 
     phi::distributed::NCCLCommContext* comm_ctx;
     phi::GPUContext* calc_ctx;
@@ -150,7 +151,14 @@ public:
 
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
 
-    cudaStream_t get_comm_stream() const;
+    at::cuda::CUDAStream get_comm_stream() const {
+        return comm_stream.value();
+    }
+    
+    // Helper to get raw stream for CUDA APIs
+    cudaStream_t get_comm_stream_raw() const {
+        return comm_stream.value().stream();
+    }
 
     void sync(const std::vector<int>& device_ids,
               const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
@@ -312,6 +320,17 @@ inline void SetAllocatorStreamForGPUContext(gpuStream_t stream,
   ctx->SetAllocator(paddle::memory::allocation::AllocatorFacade::Instance()
                         .GetAllocator(ctx->GetPlace(), stream)
                         .get());
+}
+
+// Helper to create CUDAStream from raw cudaStream_t
+inline at::cuda::CUDAStream make_cuda_stream(cudaStream_t raw_stream, int device_id = -1) {
+    if (device_id == -1) {
+        CUDA_CHECK(cudaGetDevice(&device_id));
+    }
+    c10::StreamId sid = static_cast<c10::StreamId>(reinterpret_cast<intptr_t>(raw_stream));
+    return at::cuda::CUDAStream(c10::Stream(c10::Stream::UNSAFE,
+                                            c10::Device(c10::DeviceType::CUDA, device_id),
+                                            sid));
 }
 
 }  // namespace deep_ep
