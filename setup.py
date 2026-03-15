@@ -32,6 +32,8 @@ if __name__ == '__main__':
             )
             disable_nvshmem = True
     else:
+        # When NVSHMEM_DIR is provided (e.g. wheel install), resolve the actual SONAME.
+        nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
         disable_nvshmem = False
 
     if not disable_nvshmem:
@@ -54,7 +56,8 @@ if __name__ == '__main__':
         include_dirs.extend([f'{nvshmem_dir}/include'])
         library_dirs.extend([f'{nvshmem_dir}/lib'])
         nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
-        extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
+        # Keep device lib in dlink only; adding it here causes duplicate symbols.
+        extra_link_args.extend([f'-l:{nvshmem_host_lib}', f'-Wl,-rpath,{nvshmem_dir}/lib'])
 
     if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
         # Prefer A100
