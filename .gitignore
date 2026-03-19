@@ -7,4 +7,3 @@ build/
 .vscode/
 */cmake-build-*/
 *.egg-info
-.humanize
