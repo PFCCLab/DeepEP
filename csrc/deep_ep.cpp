@@ -210,12 +210,12 @@ Buffer::Buffer(int rank,
             reinterpret_cast<int**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes);
 
         // No need to synchronize, will do a full device sync during `sync`
-        CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream.stream()));
+        CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
     }
 
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
-    CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream.stream()));
+    CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
 
     // MoE counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
@@ -302,7 +302,7 @@ void Buffer::destroy() {
 
     if (num_nvl_bytes > 0) {
         // Barrier
-        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream.stream());
+        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks, comm_stream);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Close remote IPC
@@ -420,7 +420,7 @@ Buffer::get_dispatch_layout(
     auto compute_stream = make_cuda_stream(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
-        deep_ep::SetAllocatorStreamForGPUContext(comm_stream.stream(), calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -447,7 +447,7 @@ Buffer::get_dispatch_layout(
                                 num_topk,
                                 num_ranks,
                                 num_experts,
-                                comm_stream.stream());
+                                comm_stream);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -582,7 +582,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     auto compute_stream = make_cuda_stream(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
-        deep_ep::SetAllocatorStreamForGPUContext(comm_stream.stream(), calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -608,7 +608,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
         // Copy rank prefix matrix and clean flags
         intranode::cached_notify_dispatch(
-            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream.stream());
+            rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
     } else {
         rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -637,7 +637,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                                    buffer_ptrs_gpu,
                                    barrier_signal_ptrs_gpu,
                                    rank,
-                                   comm_stream.stream(),
+                                   comm_stream,
                                    num_channels);
 
         if (num_worst_tokens > 0) {
@@ -731,7 +731,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         buffer_ptrs_gpu,
                         rank,
                         num_ranks,
-                        comm_stream.stream(),
+                        comm_stream,
                         config.num_sms,
                         config.num_max_nvl_chunked_send_tokens,
                         config.num_max_nvl_chunked_recv_tokens);
@@ -833,7 +833,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     auto compute_stream = make_cuda_stream(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
-        deep_ep::SetAllocatorStreamForGPUContext(comm_stream.stream(), calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -867,7 +867,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                                      barrier_signal_ptrs_gpu,
                                      rank,
                                      num_ranks,
-                                     comm_stream.stream());
+                                     comm_stream);
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
@@ -906,7 +906,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        buffer_ptrs_gpu,
                        rank,
                        num_ranks,
-                       comm_stream.stream(),
+                       comm_stream,
                         config.num_sms,
                        config.num_max_nvl_chunked_send_tokens,
                        config.num_max_nvl_chunked_recv_tokens);
@@ -1075,7 +1075,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     auto compute_stream = make_cuda_stream(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
-        deep_ep::SetAllocatorStreamForGPUContext(comm_stream.stream(), calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -1120,7 +1120,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                  config.num_max_nvl_chunked_recv_tokens,
                                  barrier_signal_ptrs_gpu,
                                  rank,
-                                 comm_stream.stream(),
+                                 comm_stream,
                                  config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                  num_nvl_bytes,
                                  true,
@@ -1161,7 +1161,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    config.num_max_nvl_chunked_recv_tokens,
                                    barrier_signal_ptrs_gpu,
                                    rank,
-                                   comm_stream.stream(),
+                                   comm_stream,
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                    num_nvl_bytes,
                                    low_latency_mode);
@@ -1268,7 +1268,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         rank,
                         num_ranks,
                         cached_mode,
-                        comm_stream.stream(),
+                        comm_stream,
                         num_channels,
                         low_latency_mode);
 
@@ -1393,7 +1393,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     auto compute_stream = make_cuda_stream(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
-        deep_ep::SetAllocatorStreamForGPUContext(comm_stream.stream(), calc_ctx);
+        deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
     }
 
     // Wait previous tasks to be finished
@@ -1440,7 +1440,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                              config.num_max_nvl_chunked_recv_tokens,
                              barrier_signal_ptrs_gpu,
                              rank,
-                             comm_stream.stream(),
+                             comm_stream,
                              config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                              num_nvl_bytes,
                              false,
@@ -1486,7 +1486,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        config.num_max_nvl_chunked_recv_tokens,
                        rank,
                        num_ranks,
-                       comm_stream.stream(),
+                       comm_stream,
                        num_channels,
                        low_latency_mode);
 
