@@ -86,10 +86,10 @@ private:
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
-    std::optional<at::cuda::CUDAStream> comm_stream;
-
-    phi::distributed::NCCLCommContext* comm_ctx;
-    phi::GPUContext* calc_ctx;
+    at::cuda::CUDAStream comm_stream;
+    
+    phi::distributed::NCCLCommContext* comm_ctx = nullptr;
+    phi::GPUContext* calc_ctx = nullptr;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
@@ -152,12 +152,12 @@ public:
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
 
     at::cuda::CUDAStream get_comm_stream() const {
-        return comm_stream.value();
+        return comm_stream;
     }
     
     // Helper to get raw stream for CUDA APIs
     cudaStream_t get_comm_stream_raw() const {
-        return comm_stream.value().stream();
+        return comm_stream.stream();
     }
 
     void sync(const std::vector<int>& device_ids,
