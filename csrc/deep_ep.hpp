@@ -155,11 +155,6 @@ public:
         return comm_stream;
     }
     
-    // Helper to get raw stream for CUDA APIs
-    cudaStream_t get_comm_stream_raw() const {
-        return comm_stream.stream();
-    }
-
     void sync(const std::vector<int>& device_ids,
               const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
               const std::optional<pybind11::bytearray>& root_unique_id_opt);
