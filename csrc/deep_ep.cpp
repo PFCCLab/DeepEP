@@ -1908,7 +1908,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_comm_stream",
            [](deep_ep::Buffer &self) {
              int device_id = self.get_local_device_id();
-             cudaStream_t comm_stream = self.get_comm_stream();
+                         cudaStream_t comm_stream = at::cuda::CUDAStream(self.get_comm_stream()).stream();
              auto s = phi::Stream(reinterpret_cast<phi::StreamId>(comm_stream));
 #if defined(PADDLE_WITH_CUDA)
              return phi::CUDAStream(phi::GPUPlace(device_id), s);
