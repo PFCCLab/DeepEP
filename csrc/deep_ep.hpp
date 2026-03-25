@@ -151,7 +151,7 @@ public:
 
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
 
-    at::cuda::CUDAStream get_comm_stream() const {
+    torch::Stream get_comm_stream() const {
         return comm_stream;
     }
     
