@@ -6,6 +6,7 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <c10/util/Optional.h>
 // #include <torch/torch.h>
 #include <torch/python.h>
 #include <cub/cub.cuh>
@@ -40,7 +41,7 @@ struct PermuteArgs {
 struct UnpermuteArgs {
   // Input tensors
   torch::Tensor permuted_tokens;
-  std::optional<torch::Tensor> permuted_probs;
+  c10::optional<torch::Tensor> permuted_probs;
   torch::Tensor row_id_map;
 
   // The address of the output
@@ -104,7 +105,7 @@ struct UnpermuteArgs {
   * num_of_local_experts], type: ProbType, now only support float
   */
  template <typename DType, typename ProbType, typename ScalarType>
- std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>>
+ std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>>
  permute_launcher(PermuteArgs args);
  
  /**

@@ -462,7 +462,7 @@ def init_dist_env(world_size, seed=20):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Test intranode EP kernels')
-    parser.add_argument('--num-processes', type=int, default=8,
+    parser.add_argument('--num-processes', type=int, default=4,
                        help='Number of processes to spawn (default: 4)')
     parser.add_argument('--nsys-profile', action='store_true', default=False,
                        help='benchmark with nsys profile or not (default: False)')

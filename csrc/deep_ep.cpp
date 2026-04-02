@@ -1251,9 +1251,6 @@ void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int 
     check_boundary(clean_meta_0.first, clean_meta_0.second * sizeof(int));
     check_boundary(clean_meta_1.first, clean_meta_1.second * sizeof(int));
 
-    // internode_ll::clean_low_latency_buffer(clean_meta_0.first, clean_meta_0.second,
-    //                                        clean_meta_1.first, clean_meta_1.second,
-    //                                        calc_ctx->stream());
     internode_ll::clean_low_latency_buffer(clean_meta_0.first, clean_meta_0.second,
                                            clean_meta_1.first, clean_meta_1.second,
                                            at::cuda::getCurrentCUDAStream());
@@ -1307,7 +1304,6 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
-    // auto compute_stream = calc_ctx->stream();
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not (async and return_recv_hook));
@@ -1462,7 +1458,6 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
-    // auto compute_stream = calc_ctx->stream();
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not (async and return_recv_hook));
@@ -1778,7 +1773,7 @@ Buffer::dispatch_pcie(const torch::Tensor& x, const std::optional<torch::Tensor>
     } else {
         stream_wait(compute_stream, comm_stream);
     }
-    
+
     if (allocate_on_comm_stream)
         deep_ep::SetAllocatorStreamForGPUContext(compute_stream, calc_ctx);
 

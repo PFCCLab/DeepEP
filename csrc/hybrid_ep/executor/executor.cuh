@@ -27,13 +27,13 @@ public:
         torch::Tensor sparse_to_dense_map;
         torch::Tensor rdma_to_attn_map;
         torch::Tensor attn_to_rdma_map;
-        std::optional<torch::Tensor> num_dispatched_tokens_tensor;  // Used in the permute
-        std::optional<torch::Tensor> local_expert_routing_map;      // Used in the permute
+        c10::optional<torch::Tensor> num_dispatched_tokens_tensor;  // Used in the permute
+        c10::optional<torch::Tensor> local_expert_routing_map;      // Used in the permute
 
         int64_t num_dispatched_tokens = -1;
         // Used in the permute case, use up-bound to avoid synchronization to get the real num_dispatched_tokens from the pinned memory
         int64_t max_num_dispatched_tokens = -1;
-        std::optional<torch::Tensor> row_id_map;
+        c10::optional<torch::Tensor> row_id_map;
         int64_t num_permuted_tokens = -1;
         // Misc
         int pad_multiple;  // Used in the padding case of permute
@@ -56,9 +56,9 @@ public:
         torch::Tensor sparse_to_dense_map;
         torch::Tensor rdma_to_attn_map;
         torch::Tensor attn_to_rdma_map;
-        std::optional<torch::Tensor> num_dispatched_tokens_tensor;
+        c10::optional<torch::Tensor> num_dispatched_tokens_tensor;
         // Output of Permute-preprocess
-        std::optional<torch::Tensor> row_id_map;  // Used in the unpermute
+        c10::optional<torch::Tensor> row_id_map;  // Used in the unpermute
         // Used in the sync-free Unpermute
         int64_t num_dispatched_tokens = -1;
         // Misc
@@ -90,7 +90,7 @@ public:
     template<typename DType> 
     void dispatch_core(
         HybridEpConfigInstance config, DispatchBuffers& dispatch_buffers, DispatchArgs& args);
-    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor> > 
+    std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor> > 
     dispatch_postprocess(
         HybridEpConfigInstance config, DispatchBuffers& dispatch_buffers, DispatchArgs& args); 
 
