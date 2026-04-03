@@ -74,6 +74,11 @@ typedef INT_BITS_T(TOPK_IDX_BITS) topk_idx_t;  // int32_t or int64_t
 }  // namespace deep_ep
 
 #ifndef DISABLE_NVSHMEM
+// Define __CUDACC_RDC__ to ensure EXTERN_CONSTANT is defined as `extern __constant__`
+// instead of empty, preventing multiple definition errors when linking with libnvshmem_device.a
+#ifndef __CUDACC_RDC__
+#define __CUDACC_RDC__
+#endif
 #include <device_host_transport/nvshmem_common_ibgda.h>
 #include <infiniband/mlx5dv.h>
 #include <nvshmem.h>
