@@ -139,29 +139,25 @@ Buffer::Buffer(int rank,
       num_ranks(num_ranks),
       num_nvl_bytes(num_nvl_bytes),
       num_rdma_bytes(num_rdma_bytes),
-            device_id([&]() {
-                int id = -1;
-                CUDA_CHECK(cudaGetDevice(&id));
-                return id;
-            }()),
+      device_id([&]() {
+          int id = -1;
+          CUDA_CHECK(cudaGetDevice(&id));
+          return id;
+      }()),
       enable_shrink(enable_shrink),
       low_latency_mode(low_latency_mode),
       explicitly_destroy(explicitly_destroy),
-            comm_stream([&]() {
-                auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
-                paddle::distributed::ProcessGroup* pg = map->get(context_ring_id);
-                const auto& place = phi::GPUPlace(device_id);
-                comm_ctx =
-                        reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)
-                                ->GetOrCreateCommContext(place,
-                                                                                 phi::distributed::CommType::ALLTOALL);
-                calc_ctx = reinterpret_cast<phi::GPUContext*>(
-                        reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)
-                                ->GetDeviceContext(place, true));
-                return make_cuda_stream(comm_ctx->GetStream(), device_id);
-            }()),
+      comm_stream([&]() {
+          auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+          paddle::distributed::ProcessGroup* pg = map->get(context_ring_id);
+          const auto& place = phi::GPUPlace(device_id);
+          comm_ctx = reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)->GetOrCreateCommContext(
+              place, phi::distributed::CommType::ALLTOALL);
+          calc_ctx = reinterpret_cast<phi::GPUContext*>(
+              reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)->GetDeviceContext(place, true));
+          return make_cuda_stream(comm_ctx->GetStream(), device_id);
+      }()),
       shared_memory_allocator(use_fabric) {
-
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
