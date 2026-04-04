@@ -139,15 +139,11 @@ Buffer::Buffer(int rank,
       num_ranks(num_ranks),
       num_nvl_bytes(num_nvl_bytes),
       num_rdma_bytes(num_rdma_bytes),
-      device_id([&]() {
-          int id = -1;
-          CUDA_CHECK(cudaGetDevice(&id));
-          return id;
-      }()),
       enable_shrink(enable_shrink),
       low_latency_mode(low_latency_mode),
       explicitly_destroy(explicitly_destroy),
       comm_stream([&]() {
+          CUDA_CHECK(cudaGetDevice(&device_id));
           auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
           paddle::distributed::ProcessGroup* pg = map->get(context_ring_id);
           const auto& place = phi::GPUPlace(device_id);
