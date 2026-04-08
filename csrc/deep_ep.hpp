@@ -317,15 +317,4 @@ inline void SetAllocatorStreamForGPUContext(gpuStream_t stream,
                         .get());
 }
 
-// Helper to create CUDAStream from raw cudaStream_t
-inline at::cuda::CUDAStream make_cuda_stream(cudaStream_t raw_stream, int device_id = -1) {
-    if (device_id == -1) {
-        CUDA_CHECK(cudaGetDevice(&device_id));
-    }
-    c10::StreamId sid = static_cast<c10::StreamId>(reinterpret_cast<intptr_t>(raw_stream));
-    return at::cuda::CUDAStream(c10::Stream(c10::Stream::UNSAFE,
-                                            c10::Device(c10::DeviceType::CUDA, device_id),
-                                            sid));
-}
-
 }  // namespace deep_ep
