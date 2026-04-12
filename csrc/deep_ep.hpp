@@ -85,11 +85,10 @@ private:
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
-    // Stream for communication
-    at::cuda::CUDAStream comm_stream;
-    
     phi::distributed::NCCLCommContext* comm_ctx = nullptr;
     phi::GPUContext* calc_ctx = nullptr;
+    // Declared after the contexts because its constructor lambda assigns them.
+    at::cuda::CUDAStream comm_stream;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
