@@ -899,7 +899,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        rank,
                        num_ranks,
                        comm_stream,
-                        config.num_sms,
+                       config.num_sms,
                        config.num_max_nvl_chunked_send_tokens,
                        config.num_max_nvl_chunked_recv_tokens);
 
