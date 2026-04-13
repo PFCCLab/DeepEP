@@ -292,7 +292,7 @@ void HybridEPBuffer::allocate_buffer() {
 
 void HybridEPBuffer::exchange_remote_handle() {
   // Use Python's torch.distributed APIs through py::object
-  auto torch_distributed = py::module_::import("torch.distributed");
+  auto torch_distributed = py::module_::import("paddle.distributed");
   
   // Move tensors to CUDA for communication
   // auto dispatch_cuda = dispatch_memory_handles.cuda();

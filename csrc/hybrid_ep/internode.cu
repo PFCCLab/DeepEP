@@ -700,7 +700,7 @@ void RDMACoordinator::destroy() {
 }
 
 void RDMACoordinator::exchange_remote_rdma_info(remote_info* dst, remote_info *src, int num_of_qps) {
-  auto torch_distributed = py::module_::import("torch.distributed");
+  auto torch_distributed = py::module_::import("paddle.distributed");
   auto num_bytes = static_cast<int64_t>(num_of_qps) *
                 static_cast<int64_t>(sizeof(remote_info));
   torch::Tensor buffer = torch::empty({num_bytes}, at::device(at::kCPU).dtype(at::kByte));

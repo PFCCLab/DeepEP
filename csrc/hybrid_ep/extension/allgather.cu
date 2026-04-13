@@ -169,7 +169,7 @@ void CustomAllgather::open_ag_handles() {
     if(num_of_nodes > 1 ) return;
 
     // Use Python's torch.distributed APIs through py::object
-    auto torch_distributed = py::module_::import("torch.distributed");    
+    auto torch_distributed = py::module_::import("paddle.distributed");    
     // Move tensors to CUDA for communication
     // auto ag_handles_cuda = ag_handles.cuda(); 
     MemHandle handles[2];
