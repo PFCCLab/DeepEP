@@ -9,7 +9,6 @@ from paddle.utils.cpp_extension.extension_utils import (
     add_compile_flag,
 )
 
-
 # Wheel specific: the wheels only include the soname of the host library `libnvshmem_host.so.X`
 def get_nvshmem_host_lib_name(base_dir):
     path = Path(base_dir).joinpath('lib')
@@ -83,7 +82,7 @@ if __name__ == '__main__':
     nvshmem_host_lib = 'libnvshmem_host.so'
     if nvshmem_dir is None:
         try:
-            nvshmem_dir = importlib.util.find_spec('nvidia.nvshmem').submodule_search_locations[0]
+            nvshmem_dir = importlib.util.find_spec("nvidia.nvshmem").submodule_search_locations[0]
             nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
             import nvidia.nvshmem as nvshmem  # noqa: F401
         except (ModuleNotFoundError, AttributeError, IndexError):
