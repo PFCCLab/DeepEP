@@ -57,8 +57,9 @@ if __name__ == '__main__':
         extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
 
     if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
-        # Prefer A100
-        os.environ['PADDLE_CUDA_ARCH_LIST'] = os.getenv('PADDLE_CUDA_ARCH_LIST', '8.0')
+        # Prefer A100 - only set default if user hasn't specified
+        if 'PADDLE_CUDA_ARCH_LIST' not in os.environ:
+            os.environ['PADDLE_CUDA_ARCH_LIST'] = '8.0'
 
         # Disable some SM90 features: FP8, launch methods, and TMA
         cxx_flags.append('-DDISABLE_SM90_FEATURES')
@@ -67,8 +68,9 @@ if __name__ == '__main__':
         # Disable internode and low-latency kernels
         assert disable_nvshmem
     else:
-        # Prefer H800 series
-        os.environ['PADDLE_CUDA_ARCH_LIST'] = os.getenv('PADDLE_CUDA_ARCH_LIST', '9.0')
+        # Prefer H800 series - only set default if user hasn't specified
+        if 'PADDLE_CUDA_ARCH_LIST' not in os.environ:
+            os.environ['PADDLE_CUDA_ARCH_LIST'] = '9.0'
 
     # CUDA 12 flags
     nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
