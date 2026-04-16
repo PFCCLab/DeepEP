@@ -1,138 +1,243 @@
+# Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import subprocess
 import setuptools
 import importlib
 
 from pathlib import Path
-from paddle.utils.cpp_extension import BuildExtension, CUDAExtension, _get_cuda_arch_flags
+from paddle.utils.cpp_extension import (
+    BuildExtension,
+    CUDAExtension,
+    _get_cuda_arch_flags,
+)
 from paddle.utils.cpp_extension.extension_utils import (
     add_compile_flag,
 )
 
+
 # Wheel specific: the wheels only include the soname of the host library `libnvshmem_host.so.X`
 def get_nvshmem_host_lib_name(base_dir):
-    path = Path(base_dir).joinpath('lib')
-    for file in path.rglob('libnvshmem_host.so.*'):
+    path = Path(base_dir).joinpath("lib")
+    for file in path.rglob("libnvshmem_host.so.*"):
         return file.name
-    raise ModuleNotFoundError('libnvshmem_host.so not found')
+    raise ModuleNotFoundError("libnvshmem_host.so not found")
 
 
-if __name__ == '__main__':
+def _detect_local_gpu_arch():
+    """Auto-detect the compute capability of the first visible GPU via nvidia-smi.
+
+    Returns a string like '9.0', or None if detection fails.
+    DeepEP requires GPU compute capability >= 9.0 (SM90+).
+    """
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL,
+        )
+        caps = {line.strip() for line in out.decode().splitlines() if line.strip()}
+        # Return the first available architecture (usually all GPUs are same)
+        return sorted(caps)[0] if caps else None
+    except Exception:
+        return None
+
+
+def _resolve_cuda_arch():
+    """Resolve CUDA architecture for compilation.
+
+    Priority (highest first):
+    1. PADDLE_CUDA_ARCH_LIST env var (user-specified)
+    2. Auto-detect from the local GPU via nvidia-smi
+    3. Default to '9.0' (SM90)
+
+    Returns a string like '9.0', '10.0', '10.3', etc.
+    Raises ValueError if the detected/archived arch is < 9.0.
+    """
+    import re
+
+    # 1. Try user-specified env var
+    raw = os.environ.get("PADDLE_CUDA_ARCH_LIST", "").strip()
+    if raw:
+        # Parse semicolon- or comma-separated values, use the first one
+        arch = re.split(r"[;,]", raw)[0].strip()
+    else:
+        # 2. Auto-detect from local GPU
+        arch = _detect_local_gpu_arch()
+        if not arch:
+            # 3. Fallback to default
+            arch = "9.0"
+
+    # Validate: DeepEP requires SM90+ (compute capability >= 9.0)
+    try:
+        major, minor = map(int, arch.split("."))
+        if major < 9:
+            raise ValueError(
+                f"DeepEP requires GPU compute capability >= 9.0 (SM90+), "
+                f"but detected architecture {arch}. "
+                f"Please use a GPU with SM90+ (H100/H800/B100/B30Z/etc.) or "
+                f"set PADDLE_CUDA_ARCH_LIST to a supported architecture."
+            )
+    except ValueError as e:
+        raise ValueError(f"Invalid CUDA architecture format: {arch}") from e
+
+    return arch
+
+
+if __name__ == "__main__":
     disable_nvshmem = False
-    nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
-    nvshmem_host_lib = 'libnvshmem_host.so'
+    nvshmem_dir = os.getenv("NVSHMEM_DIR", None)
+    nvshmem_host_lib = "libnvshmem_host.so"
     if nvshmem_dir is None:
         try:
-            nvshmem_dir = importlib.util.find_spec("nvidia.nvshmem").submodule_search_locations[0]
+            nvshmem_dir = importlib.util.find_spec(
+                "nvidia.nvshmem"
+            ).submodule_search_locations[0]
             nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
             import nvidia.nvshmem as nvshmem  # noqa: F401
         except (ModuleNotFoundError, AttributeError, IndexError):
             print(
-                'Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode and low-latency features are disabled\n'
+                "Warning: `NVSHMEM_DIR` is not specified, and the NVSHMEM module is not installed. All internode and low-latency features are disabled\n"
             )
             disable_nvshmem = True
     else:
         disable_nvshmem = False
 
     if not disable_nvshmem:
-        assert os.path.exists(nvshmem_dir), f'The specified NVSHMEM directory does not exist: {nvshmem_dir}'
+        assert os.path.exists(nvshmem_dir), (
+            f"The specified NVSHMEM directory does not exist: {nvshmem_dir}"
+        )
 
-    cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
-    nvcc_flags = ['-O3', '-Xcompiler', '-O3']
-    sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu']
-    include_dirs = ['csrc/']
+    cxx_flags = [
+        "-O3",
+        "-Wno-deprecated-declarations",
+        "-Wno-unused-variable",
+        "-Wno-sign-compare",
+        "-Wno-reorder",
+        "-Wno-attributes",
+    ]
+    nvcc_flags = ["-O3", "-Xcompiler", "-O3"]
+    sources = [
+        "csrc/deep_ep.cpp",
+        "csrc/kernels/runtime.cu",
+        "csrc/kernels/layout.cu",
+        "csrc/kernels/intranode.cu",
+    ]
+    include_dirs = ["csrc/"]
     library_dirs = []
     nvcc_dlink = []
-    extra_link_args = ['-lcuda']
+    extra_link_args = ["-lcuda"]
 
     # NVSHMEM flags
     if disable_nvshmem:
-        cxx_flags.append('-DDISABLE_NVSHMEM')
-        nvcc_flags.append('-DDISABLE_NVSHMEM')
+        cxx_flags.append("-DDISABLE_NVSHMEM")
+        nvcc_flags.append("-DDISABLE_NVSHMEM")
     else:
-        sources.extend(['csrc/kernels/internode.cu', 'csrc/kernels/internode_ll.cu'])
-        include_dirs.extend([f'{nvshmem_dir}/include'])
-        library_dirs.extend([f'{nvshmem_dir}/lib'])
-        nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
-        extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
+        sources.extend(["csrc/kernels/internode.cu", "csrc/kernels/internode_ll.cu"])
+        include_dirs.extend([f"{nvshmem_dir}/include"])
+        library_dirs.extend([f"{nvshmem_dir}/lib"])
+        nvcc_dlink.extend(["-dlink", f"-L{nvshmem_dir}/lib", "-lnvshmem_device"])
+        extra_link_args.extend(
+            [
+                f"-l:{nvshmem_host_lib}",
+                "-l:libnvshmem_device.a",
+                f"-Wl,-rpath,{nvshmem_dir}/lib",
+            ]
+        )
 
-    if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
-        # Prefer A100 - only set default if user hasn't specified
-        if 'PADDLE_CUDA_ARCH_LIST' not in os.environ:
-            os.environ['PADDLE_CUDA_ARCH_LIST'] = '8.0'
+    # Resolve CUDA architecture for compilation
+    # Priority: user env var > auto-detect > default 9.0
+    # DeepEP requires SM90+ (compute capability >= 9.0)
+    if "PADDLE_CUDA_ARCH_LIST" not in os.environ:
+        resolved_arch = _resolve_cuda_arch()
+        os.environ["PADDLE_CUDA_ARCH_LIST"] = resolved_arch
 
+    if int(os.getenv("DISABLE_SM90_FEATURES", 0)):
         # Disable some SM90 features: FP8, launch methods, and TMA
-        cxx_flags.append('-DDISABLE_SM90_FEATURES')
-        nvcc_flags.append('-DDISABLE_SM90_FEATURES')
+        cxx_flags.append("-DDISABLE_SM90_FEATURES")
+        nvcc_flags.append("-DDISABLE_SM90_FEATURES")
 
         # Disable internode and low-latency kernels
         assert disable_nvshmem
-    else:
-        # Prefer H800 series - only set default if user hasn't specified
-        if 'PADDLE_CUDA_ARCH_LIST' not in os.environ:
-            os.environ['PADDLE_CUDA_ARCH_LIST'] = '9.0'
 
     # CUDA 12 flags
-    nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
+    nvcc_flags.extend(["-rdc=true", "--ptxas-options=--register-usage-level=10"])
 
-    # Disable LD/ST tricks, as some CUDA version does not support `.L1::no_allocate`
-    if os.environ['PADDLE_CUDA_ARCH_LIST'].strip() != '9.0':
-        assert int(os.getenv('DISABLE_AGGRESSIVE_PTX_INSTRS', 1)) == 1
-        os.environ['DISABLE_AGGRESSIVE_PTX_INSTRS'] = '1'
+    # Disable LD/ST tricks for architectures other than SM90
+    # (SM100/SM103 have different memory subsystem behavior)
+    arch = os.environ["PADDLE_CUDA_ARCH_LIST"].strip()
+    if arch not in ("9.0", "9.0a"):
+        assert int(os.getenv("DISABLE_AGGRESSIVE_PTX_INSTRS", 1)) == 1
+        os.environ["DISABLE_AGGRESSIVE_PTX_INSTRS"] = "1"
 
     # Disable aggressive PTX instructions
-    if int(os.getenv('DISABLE_AGGRESSIVE_PTX_INSTRS', '1')):
-        cxx_flags.append('-DDISABLE_AGGRESSIVE_PTX_INSTRS')
-        nvcc_flags.append('-DDISABLE_AGGRESSIVE_PTX_INSTRS')
+    if int(os.getenv("DISABLE_AGGRESSIVE_PTX_INSTRS", "1")):
+        cxx_flags.append("-DDISABLE_AGGRESSIVE_PTX_INSTRS")
+        nvcc_flags.append("-DDISABLE_AGGRESSIVE_PTX_INSTRS")
 
     # Bits of `topk_idx.dtype`, choices are 32 and 64
     if "TOPK_IDX_BITS" in os.environ:
-        topk_idx_bits = int(os.environ['TOPK_IDX_BITS'])
-        cxx_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
-        nvcc_flags.append(f'-DTOPK_IDX_BITS={topk_idx_bits}')
+        topk_idx_bits = int(os.environ["TOPK_IDX_BITS"])
+        cxx_flags.append(f"-DTOPK_IDX_BITS={topk_idx_bits}")
+        nvcc_flags.append(f"-DTOPK_IDX_BITS={topk_idx_bits}")
 
     # Put them together
     extra_compile_args = {
-        'cxx': cxx_flags,
-        'nvcc': nvcc_flags,
+        "cxx": cxx_flags,
+        "nvcc": nvcc_flags,
     }
     if len(nvcc_dlink) > 0:
         nvcc_dlink = nvcc_dlink + _get_cuda_arch_flags()
-        extra_compile_args['nvcc_dlink'] = nvcc_dlink
+        extra_compile_args["nvcc_dlink"] = nvcc_dlink
 
     # Summary
-    print('Build summary:')
-    print(f' > Sources: {sources}')
-    print(f' > Includes: {include_dirs}')
-    print(f' > Libraries: {library_dirs}')
-    print(f' > Compilation flags: {extra_compile_args}')
-    print(f' > Link flags: {extra_link_args}')
-    print(f' > Arch list: {os.environ["PADDLE_CUDA_ARCH_LIST"]}')
-    print(f' > NVSHMEM path: {nvshmem_dir}')
+    print("Build summary:")
+    print(f" > Sources: {sources}")
+    print(f" > Includes: {include_dirs}")
+    print(f" > Libraries: {library_dirs}")
+    print(f" > Compilation flags: {extra_compile_args}")
+    print(f" > Link flags: {extra_link_args}")
+    print(f" > Arch list: {os.environ['PADDLE_CUDA_ARCH_LIST']}")
+    print(f" > NVSHMEM path: {nvshmem_dir}")
     print()
 
     # noinspection PyBroadException
     try:
-        cmd = ['git', 'rev-parse', '--short', 'HEAD']
-        revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
+        cmd = ["git", "rev-parse", "--short", "HEAD"]
+        revision = "+" + subprocess.check_output(cmd).decode("ascii").rstrip()
     except Exception as _:
-        revision = ''
+        revision = ""
 
-    add_compile_flag(extra_compile_args, ['-DPADDLE_WITH_CUDA'])
-    add_compile_flag(extra_compile_args, ['-DWITH_DISTRIBUTE'])
-    add_compile_flag(extra_compile_args, ['-DWITH_NVSHMEM'])
-    add_compile_flag(extra_compile_args, ['-DWITH_GPU'])
-    add_compile_flag(extra_compile_args, ['-DWITH_FLUID_ONLY'])
+    add_compile_flag(extra_compile_args, ["-DPADDLE_WITH_CUDA"])
+    add_compile_flag(extra_compile_args, ["-DWITH_DISTRIBUTE"])
+    add_compile_flag(extra_compile_args, ["-DWITH_NVSHMEM"])
+    add_compile_flag(extra_compile_args, ["-DWITH_GPU"])
+    add_compile_flag(extra_compile_args, ["-DWITH_FLUID_ONLY"])
 
-    setuptools.setup(name='deep_ep',
-                     version='1.2.1' + revision,
-                     packages=setuptools.find_packages(include=['deep_ep']),
-                     ext_modules=[
-                         CUDAExtension(name='deep_ep_cpp',
-                                       include_dirs=include_dirs,
-                                       library_dirs=library_dirs,
-                                       sources=sources,
-                                       extra_compile_args=extra_compile_args,
-                                       extra_link_args=extra_link_args)
-                     ],
-                     cmdclass={'build_ext': BuildExtension})
+    setuptools.setup(
+        name="deep_ep",
+        version="1.2.1" + revision,
+        packages=setuptools.find_packages(include=["deep_ep"]),
+        ext_modules=[
+            CUDAExtension(
+                name="deep_ep_cpp",
+                include_dirs=include_dirs,
+                library_dirs=library_dirs,
+                sources=sources,
+                extra_compile_args=extra_compile_args,
+                extra_link_args=extra_link_args,
+            )
+        ],
+        cmdclass={"build_ext": BuildExtension},
+    )
