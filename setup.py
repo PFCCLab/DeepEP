@@ -19,14 +19,14 @@ def get_nvshmem_host_lib_name(base_dir):
 
 
 def _detect_local_gpu_arch():
-    """Auto-detect the compute capability of the first visible GPU via nvidia-smi.
+    '''Auto-detect the compute capability of the first visible GPU via nvidia-smi.
 
     Returns a string like '9.0', or None if detection fails.
     DeepEP requires GPU compute capability >= 9.0 (SM90+).
-    """
+    '''
     try:
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            ['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
             stderr=subprocess.DEVNULL,
         )
         caps = {line.strip() for line in out.decode().splitlines() if line.strip()}
@@ -37,7 +37,7 @@ def _detect_local_gpu_arch():
 
 
 def _resolve_cuda_arch():
-    """Resolve CUDA architecture for compilation.
+    '''Resolve CUDA architecture for compilation.
 
     Priority (highest first):
     1. PADDLE_CUDA_ARCH_LIST env var (user-specified)
@@ -46,35 +46,36 @@ def _resolve_cuda_arch():
 
     Returns a string like '9.0', '10.0', '10.3', etc.
     Raises ValueError if the detected/archived arch is < 9.0.
-    """
+    '''
     import re
 
     # 1. Try user-specified env var
-    raw = os.environ.get("PADDLE_CUDA_ARCH_LIST", "").strip()
+    raw = os.environ.get('PADDLE_CUDA_ARCH_LIST', '').strip()
     if raw:
         # Parse semicolon- or comma-separated values, use the first one
-        arch = re.split(r"[;,]", raw)[0].strip()
+        arch = re.split(r'[;,]', raw)[0].strip()
     else:
         # 2. Auto-detect from local GPU
         arch = _detect_local_gpu_arch()
         if not arch:
             # 3. Fallback to default
-            arch = "9.0"
+            arch = '9.0'
 
     # Validate: DeepEP requires SM90+ (compute capability >= 9.0)
     try:
-        major, minor = map(int, arch.split("."))
+        major, minor = map(int, arch.split('.'))
         if major < 9:
             raise ValueError(
-                f"DeepEP requires GPU compute capability >= 9.0 (SM90+), "
-                f"but detected architecture {arch}. "
-                f"Please use a GPU with SM90+ (H100/H800/B100/B30Z/etc.) or "
-                f"set PADDLE_CUDA_ARCH_LIST to a supported architecture."
+                f'DeepEP requires GPU compute capability >= 9.0 (SM90+), '
+                f'but detected architecture {arch}. '
+                f'Please use a GPU with SM90+ (H100/H800/B100/B30Z/etc.) or '
+                f'set PADDLE_CUDA_ARCH_LIST to a supported architecture.'
             )
     except ValueError as e:
-        raise ValueError(f"Invalid CUDA architecture format: {arch}") from e
+        raise ValueError(f'Invalid CUDA architecture format: {arch}') from e
 
     return arch
+
 
 if __name__ == '__main__':
     disable_nvshmem = False
@@ -82,7 +83,7 @@ if __name__ == '__main__':
     nvshmem_host_lib = 'libnvshmem_host.so'
     if nvshmem_dir is None:
         try:
-            nvshmem_dir = importlib.util.find_spec("nvidia.nvshmem").submodule_search_locations[0]
+            nvshmem_dir = importlib.util.find_spec('nvidia.nvshmem').submodule_search_locations[0]
             nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
             import nvidia.nvshmem as nvshmem  # noqa: F401
         except (ModuleNotFoundError, AttributeError, IndexError):
@@ -115,25 +116,28 @@ if __name__ == '__main__':
         nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
         extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
 
-    if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
-        # Prefer A100
-        os.environ['PADDLE_CUDA_ARCH_LIST'] = os.getenv('PADDLE_CUDA_ARCH_LIST', '8.0')
+    # Resolve CUDA architecture for compilation
+    # Priority: user env var > auto-detect > default 9.0
+    # DeepEP requires SM90+ (compute capability >= 9.0)
+    if 'PADDLE_CUDA_ARCH_LIST' not in os.environ:
+        resolved_arch = _resolve_cuda_arch()
+        os.environ['PADDLE_CUDA_ARCH_LIST'] = resolved_arch
 
+    if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
         # Disable some SM90 features: FP8, launch methods, and TMA
         cxx_flags.append('-DDISABLE_SM90_FEATURES')
         nvcc_flags.append('-DDISABLE_SM90_FEATURES')
 
         # Disable internode and low-latency kernels
         assert disable_nvshmem
-    else:
-        # Prefer H800 series
-        os.environ['PADDLE_CUDA_ARCH_LIST'] = os.getenv('PADDLE_CUDA_ARCH_LIST', '9.0')
 
     # CUDA 12 flags
     nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
 
-    # Disable LD/ST tricks, as some CUDA version does not support `.L1::no_allocate`
-    if os.environ['PADDLE_CUDA_ARCH_LIST'].strip() != '9.0':
+    # Disable LD/ST tricks for architectures other than SM90
+    # (SM100/SM103 have different memory subsystem behavior)
+    arch = os.environ['PADDLE_CUDA_ARCH_LIST'].strip()
+    if arch not in ('9.0', '9.0a'):
         assert int(os.getenv('DISABLE_AGGRESSIVE_PTX_INSTRS', 1)) == 1
         os.environ['DISABLE_AGGRESSIVE_PTX_INSTRS'] = '1'
 
