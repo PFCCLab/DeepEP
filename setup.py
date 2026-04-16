@@ -67,7 +67,7 @@ def _resolve_cuda_arch():
             raise ValueError(
                 f'DeepEP requires GPU compute capability >= 9.0 (SM90+), '
                 f'but detected architecture {arch}. '
-                f'Please use a GPU with SM90+ (H100/H800/B100/B30Z/etc.) or '
+                f'Please use a GPU with SM90+'
                 f'set PADDLE_CUDA_ARCH_LIST to a supported architecture.'
             )
     except ValueError as e:
@@ -133,8 +133,6 @@ if __name__ == '__main__':
     # CUDA 12 flags
     nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
 
-    # Disable LD/ST tricks for architectures other than SM90
-    # (SM100/SM103 have different memory subsystem behavior)
     arch = os.environ['PADDLE_CUDA_ARCH_LIST'].strip()
     if arch not in ('9.0', '9.0a'):
         assert int(os.getenv('DISABLE_AGGRESSIVE_PTX_INSTRS', 1)) == 1
