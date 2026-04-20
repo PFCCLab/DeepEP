@@ -276,6 +276,10 @@ torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int
     return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
 }
 
+torch::Stream Buffer::get_comm_stream() const {
+    return comm_stream;
+}
+
 void Buffer::destroy() {
     EP_HOST_ASSERT(not destroyed);
 
