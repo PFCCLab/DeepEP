@@ -141,19 +141,19 @@ Buffer::Buffer(int rank,
       low_latency_mode(low_latency_mode),
       disable_nvlink_for_normal_mode(disable_nvlink_for_normal_mode),
       explicitly_destroy(explicitly_destroy),
+      comm_stream([&]() {
+          CUDA_CHECK(cudaGetDevice(&device_id));
+          auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
+          paddle::distributed::ProcessGroup* pg = map->get(context_ring_id);
+          const auto& place = phi::GPUPlace(device_id);
+          comm_ctx = reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)
+                         ->GetOrCreateCommContext(place, phi::distributed::CommType::ALLTOALL);
+          calc_ctx = reinterpret_cast<phi::GPUContext*>(
+              reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)
+                  ->GetDeviceContext(place, true));
+          return at::cuda::getStreamFromExternal(comm_ctx->GetStream(), device_id);
+      }()),
       shared_memory_allocator(use_fabric) {
-
-    CUDA_CHECK(cudaGetDevice(&device_id));
-    auto map = paddle::distributed::ProcessGroupMapFromGid::getInstance();
-    paddle::distributed::ProcessGroup* pg = map->get(context_ring_id);
-    const auto& place = phi::GPUPlace(device_id);
-    comm_ctx =
-      reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)
-          ->GetOrCreateCommContext(place, phi::distributed::CommType::ALLTOALL);
-    comm_stream = comm_ctx->GetStream();
-    calc_ctx = reinterpret_cast<phi::GPUContext*>(
-      reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)
-          ->GetDeviceContext(place, true));
 
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
@@ -276,10 +276,6 @@ torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int
     return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
 }
 
-cudaStream_t Buffer::get_comm_stream() const {
-    return comm_stream;
-}
-
 void Buffer::destroy() {
     EP_HOST_ASSERT(not destroyed);
 
@@ -388,7 +384,7 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts,
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = calc_ctx->stream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -548,7 +544,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = calc_ctx->stream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -733,7 +729,7 @@ Buffer::intranode_combine(const torch::Tensor& x, const std::optional<torch::Ten
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = calc_ctx->stream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -921,7 +917,7 @@ Buffer::internode_dispatch(const torch::Tensor& x, const std::optional<torch::Te
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = calc_ctx->stream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -1136,7 +1132,7 @@ Buffer::internode_combine(const torch::Tensor& x, const std::optional<torch::Ten
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = calc_ctx->stream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -1634,7 +1630,7 @@ Buffer::dispatch_pcie(const torch::Tensor& x, const std::optional<torch::Tensor>
     }
 
     // Stream Management
-    auto compute_stream = calc_ctx->stream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -1848,7 +1844,7 @@ Buffer::combine_pcie(const torch::Tensor& recv_x, const std::optional<torch::Ten
     }
 
     // Stream Management
-    auto compute_stream = calc_ctx->stream();
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -1942,7 +1938,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_comm_stream",
            [](deep_ep::Buffer &self) {
              int device_id = self.get_local_device_id();
-             cudaStream_t comm_stream = self.get_comm_stream();
+             cudaStream_t comm_stream = at::cuda::CUDAStream(self.get_comm_stream()).stream();
              auto s = phi::Stream(reinterpret_cast<phi::StreamId>(comm_stream));
 #if defined(PADDLE_WITH_CUDA)
              return phi::CUDAStream(phi::GPUPlace(device_id), s);

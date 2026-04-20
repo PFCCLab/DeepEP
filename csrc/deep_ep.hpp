@@ -82,11 +82,11 @@ private:
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
-    // Stream for communication
-    cudaStream_t comm_stream;
+    phi::distributed::NCCLCommContext* comm_ctx = nullptr;
+    phi::GPUContext* calc_ctx = nullptr;
 
-    phi::distributed::NCCLCommContext* comm_ctx;
-    phi::GPUContext* calc_ctx;
+    // Stream for communication. Declared after contexts because constructor lambda assigns them.
+    at::cuda::CUDAStream comm_stream;
 
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
@@ -148,7 +148,9 @@ public:
 
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
 
-    cudaStream_t get_comm_stream() const;
+    torch::Stream get_comm_stream() const {
+        return comm_stream;
+    }
 
     void sync(const std::vector<int>& device_ids, const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles, const std::optional<pybind11::bytearray>& root_unique_id_opt);
 
