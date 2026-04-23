@@ -5,6 +5,8 @@ import os
 import shutil
 import hybrid_ep_cpp
 import warnings
+import contextlib
+import time
 from paddle.distributed.communication.group import Group
 import paddle
 
@@ -48,6 +50,14 @@ def indices_to_map(
     return routing_map, probs
 
 
+def _nvtx_range(message: str):
+    nvtx = getattr(torch.cuda, "nvtx", None)
+    nvtx_range = getattr(nvtx, "range", None)
+    if nvtx_range is None:
+        return contextlib.nullcontext()
+    return nvtx_range(message)
+
+
 class HybridEPBuffer:
     def __init__(
         self,
@@ -76,15 +86,30 @@ class HybridEPBuffer:
             self.group_size > 1
         ), f"The hybrid-ep kernel should be used with at least 2 ranks, but got {self.group_size}."
 
-        # Use environment variable or default to group_size (all ranks in one node)
-        # Note: detect_accessible_ranks is disabled because it uses PyTorch distributed API
-        # which is incompatible with Paddle's Group object
-        env_value = os.getenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN")
-        if env_value is not None:
-            self.num_of_hybrid_ep_ranks_per_nvlink_domain = int(env_value)
+        if num_of_hybrid_ep_ranks_per_nvlink_domain is not None:
+            self.num_of_hybrid_ep_ranks_per_nvlink_domain = int(
+                num_of_hybrid_ep_ranks_per_nvlink_domain
+            )
         else:
-            # Default: assume all ranks are in the same NVLink domain (single node)
-            self.num_of_hybrid_ep_ranks_per_nvlink_domain = self.group_size
+            env_value = os.getenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN")
+            if env_value is not None:
+                self.num_of_hybrid_ep_ranks_per_nvlink_domain = int(env_value)
+            else:
+                local_size = os.getenv("PADDLE_LOCAL_SIZE")
+                if local_size is not None:
+                    self.num_of_hybrid_ep_ranks_per_nvlink_domain = int(
+                        local_size
+                    )
+                else:
+                    visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
+                    if visible_devices:
+                        self.num_of_hybrid_ep_ranks_per_nvlink_domain = len(
+                            [d for d in visible_devices.split(",") if d.strip()]
+                        )
+                    else:
+                        self.num_of_hybrid_ep_ranks_per_nvlink_domain = (
+                            self.group_size
+                        )
         
         assert (
             self.group_size % self.num_of_hybrid_ep_ranks_per_nvlink_domain == 0
@@ -445,7 +470,7 @@ class HybridEPBuffer:
             warnings.warn("The use_host_meta is deprecated, it will be removed in the future.")
             non_blocking = not use_host_meta
 
-        with torch.cuda.nvtx.range("hybrid-ep dispatch with permute phase"):
+        with _nvtx_range("hybrid-ep dispatch with permute phase"):
             num_of_tokens_per_rank, hidden_dim = hidden.shape
             if routing_map is not None:
                 assert routing_map.dtype == torch.bool
@@ -567,7 +592,7 @@ class HybridEPBuffer:
         if num_dispatched_tokens is not None:
             warnings.warn("The num_dispatched_tokens is deprecated, it will be removed in the future.")
 
-        with torch.cuda.nvtx.range("hybrid-ep combine with unpermute phase"):
+        with _nvtx_range("hybrid-ep combine with unpermute phase"):
             assert self.config is not None, "Please initialize the config first."
             assert handle is not None, "The handle is necessary in the combine pass."
 
