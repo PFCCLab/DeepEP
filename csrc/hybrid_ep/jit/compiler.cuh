@@ -15,6 +15,7 @@
 #include <vector>
 #include <chrono>
 #include <iostream>
+#include <string_view>
 
 #include "config.cuh"
 #include "hybrid_ep_backend.cuh"
@@ -38,7 +39,7 @@ public:
     * file
     * @param local_rank The local rank of the current process
     * @param node_rank The node rank of the current process
-    * @param num_of_nodes The number of nodes in the communication 
+    * @param num_of_nodes The number of nodes in the communication
     * @return std::string The path of the compiled .so file
     */
     std::string build(std::string code, std::string signature, int local_rank, int node_rank, int num_of_nodes);
@@ -68,7 +69,7 @@ public:
     KernelCache(int node_rank, int local_rank, std::string base_path, std::string comm_id, bool load_cached_kernels);
 
     void run_proprecess_kernel(
-        HybridEpConfigInstance config, 
+        HybridEpConfigInstance config,
         const bool* input_routing_map,
         hybrid_ep::tmp_state_t* preprocessing_tmp,
         int32_t* sparse_to_dense_map,
@@ -84,18 +85,20 @@ public:
 
     template <typename DATA_TYPE>
     void run_dispatch_kernel(
-        HybridEpConfigInstance config, 
+        HybridEpConfigInstance config,
         hybrid_ep::dispatch_kernel_param_t<DATA_TYPE> param,
         cudaStream_t stream
     );
 
     void run_combine_kernel(
-        HybridEpConfigInstance config, 
+        HybridEpConfigInstance config,
         hybrid_ep::combine_kernel_param_t param,
         cudaStream_t stream
     );
 
 private:
+    std::any get_or_build_kernel(std::string_view kernel_key, const std::string& code, int num_of_nodes);
+
     NVCCCompiler nvcc_compiler;
     std::unordered_map<std::string, std::any> kernel_cache;
     std::string jit_dir;    // The path of the jit directory
