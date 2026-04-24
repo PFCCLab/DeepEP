@@ -176,7 +176,7 @@ class Buffer:
         return EventOverlap(EventHandle())
 
     @staticmethod
-    def get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
+    def get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int, quant_group_size: int = 128) -> int:
         """
         Get a minimum size requirement for the RDMA buffer. The size calculation will be done with BF16.
 
@@ -189,7 +189,7 @@ class Buffer:
         Returns:
             size: the RDMA buffer size recommended.
         """
-        return deep_ep_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
+        return deep_ep_cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, quant_group_size)
 
     def get_comm_stream(self) -> torch.Stream:
         """
@@ -560,7 +560,8 @@ class Buffer:
                              cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                              dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
                              use_fp8: bool = True, round_scale: bool = False, use_ue8m0: bool = False,
-                             async_finish: bool = False, return_recv_hook: bool = False) -> \
+                             async_finish: bool = False, return_recv_hook: bool = False,
+                             quant_group_size: int = 128) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
         A low-latency implementation for dispatching with IBGDA.
@@ -585,6 +586,9 @@ class Buffer:
             use_fp8: whether to enable FP8 casting, with this, the received data will be a tuple of FP8 tensor and scaling factors.
             round_scale: whether round the scaling factors into power of 2.
             use_ue8m0: whether use UE8M0 as scaling factor format (available only with `round_scale=True`).
+            quant_group_size: the number of channels per quantization group for FP8 scaling factors.
+                Supported values: 128 (default), 32, 16. Smaller values provide finer quantization granularity
+                at the cost of more scaling factors (more communication overhead).
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             return_recv_hook: return a receiving hook if set. If set, the kernel will just do the RDMA request issues,
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
@@ -595,9 +599,9 @@ class Buffer:
                 With `use_fp8=True`: the first element is a `torch.Tensor` shaped as
                 `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.float8_e4m3fn`.
                 The second tensor is the corresponding scales for the first element with shape
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 128]` with `torch.float`,
+                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // quant_group_size]` with `torch.float`,
                 if `use_ue8m0=False`. With `use_ue8m0=True`, the second one is packed and shaped as
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 512]` with type `torch.int`.
+                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // (quant_group_size * 4)]` with type `torch.int`.
                 Notice that, the last-two-dimension of the scaling tensors are in column-major for TMA compatibility.
                 With `use_fp8=False`, the result would be a tensor shaped as
                 `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.bfloat16`.
@@ -616,7 +620,8 @@ class Buffer:
                                               dispatch_wait_recv_cost_stats,
                                               num_max_dispatch_tokens_per_rank, num_experts,
                                               use_fp8, round_scale, use_ue8m0,
-                                              async_finish, return_recv_hook)
+                                              async_finish, return_recv_hook,
+                                              quant_group_size)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
         tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info,
                              packed_recv_layout_range, cumulative_local_expert_recv_stats)

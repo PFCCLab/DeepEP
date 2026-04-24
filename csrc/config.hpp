@@ -133,8 +133,9 @@ struct LowLatencyLayout {
         return reinterpret_cast<out_ptr_t>(reinterpret_cast<count_ptr_t>(ptr) + count);
     }
 
-    LowLatencyLayout(void* rdma_buffer, int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
-        const int num_scales = hidden / 128;
+    LowLatencyLayout(void* rdma_buffer, int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts,
+                     int quant_group_size = 128) {
+        const int num_scales = hidden / quant_group_size;
 
         // Dispatch and combine layout:
         //  - 2 symmetric odd/even send buffer
@@ -143,7 +144,7 @@ struct LowLatencyLayout {
 
         // Message sizes
         // NOTES: you should add a control `int4` for combine messages if you want to do data transformation
-        // NOTES: `num_scales * sizeof(nv_bfloat162)` means the per-128-channel min/max
+        // NOTES: `num_scales * sizeof(nv_bfloat162)` means the per-channel min/max
         EP_HOST_ASSERT(num_scales * sizeof(float) <= hidden);
         size_t num_bytes_per_dispatch_msg = sizeof(int4) + std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
         size_t num_bytes_per_combine_msg = num_scales * sizeof(nv_bfloat162) + hidden * sizeof(nv_bfloat16);
@@ -187,8 +188,9 @@ struct LowLatencyLayout {
     }
 };
 
-size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
-    auto num_bytes = LowLatencyLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts).total_bytes;
+size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts,
+                                      int quant_group_size = 128) {
+    auto num_bytes = LowLatencyLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, quant_group_size).total_bytes;
     return ((num_bytes + NUM_BUFFER_ALIGNMENT_BYTES) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
 }
 

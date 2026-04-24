@@ -151,7 +151,7 @@ Buffer::Buffer(int rank,
               place, phi::distributed::CommType::ALLTOALL);
           calc_ctx = reinterpret_cast<phi::GPUContext*>(
               reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)->GetDeviceContext(place, true));
-          return at::cuda::getStreamFromExternal(comm_ctx->GetStream(), device_id);
+          return at::cuda::CUDAStream(comm_ctx->GetStream());
       }()),
       shared_memory_allocator(use_fabric) {
     // Metadata memory
@@ -409,7 +409,7 @@ Buffer::get_dispatch_layout(
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    auto compute_stream = at::cuda::CUDAStream(calc_ctx->stream());
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -571,7 +571,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    auto compute_stream = at::cuda::CUDAStream(calc_ctx->stream());
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -822,7 +822,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    auto compute_stream = at::cuda::CUDAStream(calc_ctx->stream());
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -1064,7 +1064,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    auto compute_stream = at::cuda::CUDAStream(calc_ctx->stream());
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -1382,7 +1382,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    auto compute_stream = at::cuda::CUDAStream(calc_ctx->stream());
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -1567,14 +1567,15 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
                              bool round_scale,
                              bool use_ue8m0,
                              bool async,
-                             bool return_recv_hook) {
+                             bool return_recv_hook,
+                             int quant_group_size) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
 
     // Tensor checks
     // By default using `ptp128c` FP8 cast
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % 128 == 0);
+    EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % quant_group_size == 0);
     EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
     EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
@@ -1597,7 +1598,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     auto num_local_experts = num_experts / num_ranks;
 
     // Buffer control
-    LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
+    LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, quant_group_size);
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
@@ -1625,16 +1626,28 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
 
     if (use_fp8) {
         // TODO: support unaligned cases
-        EP_HOST_ASSERT(hidden % 512 == 0);
-        if (not use_ue8m0) {
-            packed_recv_x_scales = torch::empty({num_local_experts, hidden / 128, num_ranks * num_max_dispatch_tokens_per_rank},
+        EP_HOST_ASSERT(hidden % quant_group_size == 0);
+        const auto num_scales = hidden / quant_group_size;
+        const auto mn_dim = num_ranks * num_max_dispatch_tokens_per_rank;
+
+        if (quant_group_size != 128 and use_ue8m0) {
+            // CUTLASS SfAtom layout: pad token dim to 128-tile boundary, store as flat uint8
+            EP_HOST_ASSERT(round_scale);
+            EP_HOST_ASSERT(num_scales % 4 == 0 and "CUTLASS SfAtom requires num_scales to be multiple of 4");
+            const auto padded_mn = ((mn_dim + 127) / 128) * 128;
+            packed_recv_x_scales = torch::empty({num_local_experts, padded_mn, num_scales},
+                                                torch::dtype(torch::kByte).device(torch::kCUDA));
+            // No transpose - kernel writes directly in CUTLASS SfAtom order
+        } else if (not use_ue8m0) {
+            packed_recv_x_scales = torch::empty({num_local_experts, num_scales, mn_dim},
                                                 torch::dtype(torch::kFloat32).device(torch::kCUDA));
+            packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
         } else {
             EP_HOST_ASSERT(round_scale);
-            packed_recv_x_scales = torch::empty({num_local_experts, hidden / 512, num_ranks * num_max_dispatch_tokens_per_rank},
+            packed_recv_x_scales = torch::empty({num_local_experts, num_scales / 4, mn_dim},
                                                 torch::dtype(torch::kInt).device(torch::kCUDA));
+            packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
         }
-        packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
         packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
     }
 
@@ -1667,6 +1680,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             use_fp8,
             round_scale,
             use_ue8m0,
+            quant_group_size,
             workspace,
             num_device_sms,
             launch_stream.stream(),
@@ -1900,7 +1914,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_comm_stream",
            [](deep_ep::Buffer &self) {
              int device_id = self.get_local_device_id();
-                         cudaStream_t comm_stream = at::cuda::CUDAStream(self.get_comm_stream()).stream();
+             cudaStream_t comm_stream = self.get_comm_stream().stream();
              auto s = phi::Stream(reinterpret_cast<phi::StreamId>(comm_stream));
 #if defined(PADDLE_WITH_CUDA)
              return phi::CUDAStream(phi::GPUPlace(device_id), s);
