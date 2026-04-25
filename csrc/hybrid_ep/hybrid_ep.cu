@@ -12,15 +12,11 @@ std::string get_comm_id(pybind11::object process_group) {
 
   // Get the global id of each rank in the process group
   std::vector<int> global_ranks;
-  pybind11::object get_global_rank;
-  if (pybind11::hasattr(torch_distributed, "get_global_rank")) {
-    get_global_rank = torch_distributed.attr("get_global_rank");
-  } 
-  int group_size = process_group.attr("size")().cast<int>();
+  int group_id = process_group.attr("id").cast<int>(); 
+  int group_size = process_group.attr("world_size").cast<int>();
   global_ranks.reserve(group_size);
   for (int i = 0; i < group_size; ++i) {
-    int g = get_global_rank(process_group, i).cast<int>();
-    global_ranks.push_back(g);
+    global_ranks.push_back(group_id);
   }
 
   // Concatenate the global ranks into a string
@@ -296,14 +292,24 @@ void HybridEPBuffer::allocate_buffer() {
 
 void HybridEPBuffer::exchange_remote_handle() {
   // Use Python's torch.distributed APIs through py::object
-  auto torch_distributed = py::module_::import("torch.distributed");
+  auto torch_distributed = py::module_::import("paddle.distributed");
   
   // Move tensors to CUDA for communication
-  auto dispatch_cuda = dispatch_memory_handles.cuda();
-  auto combine_cuda = combine_memory_handles.cuda();
+  // auto dispatch_cuda = dispatch_memory_handles.cuda();
+  MemHandle dispatch_handles[4];
+  auto dispatch_cuda = torch::empty({static_cast<int64_t>(sizeof(dispatch_handles))},
+                                     torch::dtype(torch::kUInt8).device(torch::kCUDA));
+  CUDA_CHECK(cudaMemcpy(dispatch_cuda.data_ptr(), dispatch_memory_handles.data_ptr(), static_cast<int64_t>(sizeof(dispatch_handles)),
+                        cudaMemcpyHostToDevice));
+  // auto combine_cuda = combine_memory_handles.cuda();
+  MemHandle combine_handles[3];
+  auto combine_cuda = torch::empty({static_cast<int64_t>(sizeof(combine_handles))},
+                                    torch::dtype(torch::kUInt8).device(torch::kCUDA));
+  CUDA_CHECK(cudaMemcpy(combine_cuda.data_ptr(), combine_memory_handles.data_ptr(), static_cast<int64_t>(sizeof(combine_handles)),
+                        cudaMemcpyHostToDevice));
   
   // Get world size from process group
-  int world_size = process_group.attr("size")().cast<int>();
+  int world_size = process_group.attr("world_size").cast<int>();
   
   // Create empty tensors for allgather output
   py::list dispatch_output_list;
@@ -326,7 +332,7 @@ void HybridEPBuffer::exchange_remote_handle() {
     dispatch_cpu_tensors.push_back(dispatch_output_list[i].cast<torch::Tensor>().cpu());
     combine_cpu_tensors.push_back(combine_output_list[i].cast<torch::Tensor>().cpu());
   }
-  
+
   // Open handles from other ranks
   open_handles_from_other_ranks(dispatch_cpu_tensors, combine_cpu_tensors);
 }
@@ -452,10 +458,10 @@ bool HybridEPBuffer::update_buffer(HybridEpConfigInstance config) {
     buffer_config.token_data_type = config.token_data_type;
   }
 
-  if(buffer_config.num_of_nodes > 1 && need_reallocate) {
-    TORCH_WARN("Reallocating HybridEP buffers in multi-node mode is very slow; "
-               "adjust buffer_config to pre-allocate sufficient capacity.");
-  }
+  // if(buffer_config.num_of_nodes > 1 && need_reallocate) {
+  //   TORCH_WARN("Reallocating HybridEP buffers in multi-node mode is very slow; "
+  //              "adjust buffer_config to pre-allocate sufficient capacity.");
+  // }
 
   if(need_reallocate) {
   #ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE

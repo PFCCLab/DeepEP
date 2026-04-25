@@ -5,6 +5,10 @@ import os
 import shutil
 import hybrid_ep_cpp
 import warnings
+import contextlib
+import time
+from paddle.distributed.communication.group import Group
+import paddle
 
 def indices_to_map(
     topk_idx: torch.Tensor,
@@ -18,23 +22,46 @@ def indices_to_map(
     # Generate the routing map and the probs according to the topk_idx and topk_weights.
     assert topk_idx is not None
     routing_map = torch.zeros(
-        num_of_tokens, num_of_experts, device="cuda", dtype=torch.bool
-    )
-    routing_map = routing_map.scatter(1, topk_idx.to(torch.int64), 1).bool()
+        num_of_tokens, num_of_experts, dtype=torch.bool
+    ).cuda()
+    # routing_map = routing_map.scatter(1, topk_idx.to(torch.int64), 1).bool()
+    batch_size = routing_map.shape[0]
+    num_experts = routing_map.shape[1]
+    topk = topk_idx.shape[1]
+    row_indices = paddle.arange(0, batch_size, dtype=topk_idx.dtype).unsqueeze(1).expand([batch_size, topk])
+    indices = paddle.stack([row_indices, topk_idx], axis=2).reshape([-1, 2])
+
+    tmp = paddle.zeros([batch_size, num_experts], dtype='float32')
+    ones = paddle.ones([indices.shape[0],], dtype='float32')
+    tmp = paddle.scatter_nd_add(tmp, indices, ones)
+
+    routing_map = (tmp > 0).astype('bool')
+
     if topk_weights is not None:
         probs = torch.zeros(
-            num_of_tokens, num_of_experts, device="cuda", dtype=torch.float32
-        )
-        probs = probs.scatter(1, topk_idx.to(torch.int64), topk_weights)
+            num_of_tokens, num_of_experts, dtype=torch.float32
+        ).cuda()
+        updates = topk_weights.reshape([-1])
+        tmp = paddle.zeros_like(probs)
+        tmp = paddle.scatter_nd_add(tmp, indices, updates)
+        probs = tmp
     else:
         probs = None
     return routing_map, probs
 
 
+def _nvtx_range(message: str):
+    nvtx = getattr(torch.cuda, "nvtx", None)
+    nvtx_range = getattr(nvtx, "range", None)
+    if nvtx_range is None:
+        return contextlib.nullcontext()
+    return nvtx_range(message)
+
+
 class HybridEPBuffer:
     def __init__(
         self,
-        group: torch.distributed.ProcessGroup,
+        group: Group,
         # Parameters for the hybrid-ep buffer allocation
         hidden_dim: int,
         max_num_of_tokens_per_rank: int,
@@ -53,24 +80,36 @@ class HybridEPBuffer:
         use_mnnvl: bool = None
     ):
         self.group = group
-        self.rank = self.group.rank()
-        self.group_size = self.group.size()
+        self.rank = self.group.rank
+        self.group_size = self.group.world_size
         assert (
             self.group_size > 1
         ), f"The hybrid-ep kernel should be used with at least 2 ranks, but got {self.group_size}."
 
-        allocator = hybrid_ep_cpp.ExtendedMemoryAllocator()
-        detected_ranks = allocator.detect_accessible_ranks(self.group)
-        env_value = os.getenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN")
-        if env_value is not None:
-            self.num_of_hybrid_ep_ranks_per_nvlink_domain = int(env_value)
-            if self.num_of_hybrid_ep_ranks_per_nvlink_domain != detected_ranks:
-                warnings.warn(
-                    f"[Warning] NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN={self.num_of_hybrid_ep_ranks_per_nvlink_domain} "
-                    f"differs from detected value {detected_ranks}. Using environment variable."
-                )
+        if num_of_hybrid_ep_ranks_per_nvlink_domain is not None:
+            self.num_of_hybrid_ep_ranks_per_nvlink_domain = int(
+                num_of_hybrid_ep_ranks_per_nvlink_domain
+            )
         else:
-            self.num_of_hybrid_ep_ranks_per_nvlink_domain = detected_ranks
+            env_value = os.getenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN")
+            if env_value is not None:
+                self.num_of_hybrid_ep_ranks_per_nvlink_domain = int(env_value)
+            else:
+                local_size = os.getenv("PADDLE_LOCAL_SIZE")
+                if local_size is not None:
+                    self.num_of_hybrid_ep_ranks_per_nvlink_domain = int(
+                        local_size
+                    )
+                else:
+                    visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
+                    if visible_devices:
+                        self.num_of_hybrid_ep_ranks_per_nvlink_domain = len(
+                            [d for d in visible_devices.split(",") if d.strip()]
+                        )
+                    else:
+                        self.num_of_hybrid_ep_ranks_per_nvlink_domain = (
+                            self.group_size
+                        )
         
         assert (
             self.group_size % self.num_of_hybrid_ep_ranks_per_nvlink_domain == 0
@@ -134,15 +173,18 @@ class HybridEPBuffer:
       
         # Create C++ buffer - this will allocate all buffers during construction
         self.runtime = hybrid_ep_cpp.HybridEPBuffer(
-            self.group, 
-            self.config, 
-            self.local_rank, 
-            self.node_rank, 
-            self.group_size, 
-            os.path.dirname(os.path.abspath(__file__)), 
+            self.group,
+            self.config,
+            self.local_rank,
+            self.node_rank,
+            self.group_size,
+            os.path.dirname(os.path.abspath(__file__)),
             load_cached_kernels = load_cached_kernels,   # whether to load the cached kernels in disk
             use_shared_buffer = use_shared_buffer,      # whether to use the shared buffer for dispatch and combine
-            enable_custom_allgather = enable_custom_allgather  # whether to use the custom allgather for intra-node communication
+            # Disable custom allgather by default because its data layout is incompatible with scan kernel
+            # The custom allgather kernel produces token-interleaved layout, but scan kernel expects
+            # the standard allgather layout (rank-blocked layout)
+            enable_custom_allgather = False  # Always use standard allgather for correctness
         )
 
     def empty_jit_cache(self):
@@ -428,7 +470,7 @@ class HybridEPBuffer:
             warnings.warn("The use_host_meta is deprecated, it will be removed in the future.")
             non_blocking = not use_host_meta
 
-        with torch.cuda.nvtx.range("hybrid-ep dispatch with permute phase"):
+        with _nvtx_range("hybrid-ep dispatch with permute phase"):
             num_of_tokens_per_rank, hidden_dim = hidden.shape
             if routing_map is not None:
                 assert routing_map.dtype == torch.bool
@@ -550,7 +592,7 @@ class HybridEPBuffer:
         if num_dispatched_tokens is not None:
             warnings.warn("The num_dispatched_tokens is deprecated, it will be removed in the future.")
 
-        with torch.cuda.nvtx.range("hybrid-ep combine with unpermute phase"):
+        with _nvtx_range("hybrid-ep combine with unpermute phase"):
             assert self.config is not None, "Please initialize the config first."
             assert handle is not None, "The handle is necessary in the combine pass."
 

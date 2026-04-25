@@ -2,6 +2,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 #include "compiler.cuh"
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <pwd.h>
 
@@ -26,6 +29,44 @@ std::string get_jit_dir() {
     }
     return cache_dir + "/.deepep/hybrid_ep/jit";
 }
+
+namespace {
+
+class KernelFileLock {
+public:
+    explicit KernelFileLock(const std::string& lock_path) {
+        fd_ = open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
+        if (fd_ < 0) {
+            throw std::runtime_error("Failed to open jit lock file: " + lock_path);
+        }
+        if (flock(fd_, LOCK_EX) != 0) {
+            int saved_errno = errno;
+            close(fd_);
+            fd_ = -1;
+            throw std::runtime_error(
+                "Failed to lock jit lock file: " + lock_path + ", errno=" + std::to_string(saved_errno));
+        }
+    }
+
+    ~KernelFileLock() {
+        if (fd_ >= 0) {
+            flock(fd_, LOCK_UN);
+            close(fd_);
+        }
+    }
+
+    KernelFileLock(const KernelFileLock&) = delete;
+    KernelFileLock& operator=(const KernelFileLock&) = delete;
+
+private:
+    int fd_ = -1;
+};
+
+std::string get_shared_library_path(const std::string& jit_dir, std::string_view kernel_key) {
+    return jit_dir + "/" + std::string(kernel_key) + ".so";
+}
+
+}  // namespace
 
 NVCCCompiler::NVCCCompiler(std::string base_path, std::string comm_id): 
     base_path(base_path), comm_id(comm_id) {
@@ -235,6 +276,29 @@ node_rank(node_rank), local_rank(local_rank), nvcc_compiler(base_path, comm_id) 
     }
 }
 
+std::any KernelCache::get_or_build_kernel(std::string_view kernel_key, const std::string& code, int num_of_nodes) {
+    auto it = kernel_cache.find(std::string(kernel_key));
+    if (it != kernel_cache.end()) {
+        return it->second;
+    }
+
+    KernelFileLock lock(jit_dir + "/" + std::string(kernel_key) + ".lock");
+    it = kernel_cache.find(std::string(kernel_key));
+    if (it != kernel_cache.end()) {
+        return it->second;
+    }
+
+    auto shared_library_path = get_shared_library_path(jit_dir, kernel_key);
+    if (std::filesystem::exists(shared_library_path)) {
+        kernel_cache[std::string(kernel_key)] = nvcc_compiler.get_instance(shared_library_path, std::string(kernel_key));
+        return kernel_cache[std::string(kernel_key)];
+    }
+
+    auto build_path = nvcc_compiler.build(code, std::string(kernel_key), local_rank, node_rank, num_of_nodes);
+    kernel_cache[std::string(kernel_key)] = nvcc_compiler.get_instance(build_path, std::string(kernel_key));
+    return kernel_cache[std::string(kernel_key)];
+}
+
 void KernelCache::run_proprecess_kernel(
     HybridEpConfigInstance config, 
     const bool* input_routing_map,
@@ -260,13 +324,8 @@ void KernelCache::run_proprecess_kernel(
         config.num_of_blocks_preprocessing_api
     );
     
-    auto it = kernel_cache.find(preprocess_kernel_key);
-    if (it == kernel_cache.end()) {
-        auto preprocessing_code = nvcc_compiler.get_metadata_preprocessing_code(config);
-        auto preprocessing_path = nvcc_compiler.build(preprocessing_code, preprocess_kernel_key, local_rank, node_rank, config.num_of_nodes);
-        kernel_cache[preprocess_kernel_key] = nvcc_compiler.get_instance(preprocessing_path, preprocess_kernel_key);
-    }
-    auto preprocessing_instance = kernel_cache[preprocess_kernel_key];
+    auto preprocessing_code = nvcc_compiler.get_metadata_preprocessing_code(config);
+    auto preprocessing_instance = get_or_build_kernel(preprocess_kernel_key, preprocessing_code, config.num_of_nodes);
 
     // Cast the function pointer to the correct type
     using PreprocessingFuncPtr = void (*)(const bool*, hybrid_ep::tmp_state_t*, int32_t*, bool*, bool*, int32_t*, bool*, const int, const int, int, cudaStream_t);
@@ -313,14 +372,8 @@ void KernelCache::run_dispatch_kernel(
         config.device_side_sync_dispatch_api
     );
 
-    auto it = kernel_cache.find(dispatch_kernel_key);
-    if (it == kernel_cache.end()) {
-        // JIT Compile the kernel
-        auto dispatch_code = nvcc_compiler.get_dispatch_code(config);
-        auto dispatch_path = nvcc_compiler.build(dispatch_code, dispatch_kernel_key, local_rank, node_rank, config.num_of_nodes);
-        kernel_cache[dispatch_kernel_key] = nvcc_compiler.get_instance(dispatch_path, dispatch_kernel_key);
-    }
-    auto dispatch_instance = kernel_cache[dispatch_kernel_key];
+    auto dispatch_code = nvcc_compiler.get_dispatch_code(config);
+    auto dispatch_instance = get_or_build_kernel(dispatch_kernel_key, dispatch_code, config.num_of_nodes);
 
     // Cast the function pointer to the correct type
     using DispatchFuncPtr = void (*)(
@@ -353,14 +406,8 @@ void KernelCache::run_combine_kernel(
         config.device_side_sync_combine_api
     );
 
-    auto it = kernel_cache.find(combine_kernel_key);
-    if (it == kernel_cache.end()) {
-        // JIT Compile the kernel
-        auto combine_code = nvcc_compiler.get_combine_code(config);
-        auto combine_path = nvcc_compiler.build(combine_code, combine_kernel_key, local_rank, node_rank, config.num_of_nodes);
-        kernel_cache[combine_kernel_key] = nvcc_compiler.get_instance(combine_path, combine_kernel_key);
-    }
-    auto combine_instance = kernel_cache[combine_kernel_key];
+    auto combine_code = nvcc_compiler.get_combine_code(config);
+    auto combine_instance = get_or_build_kernel(combine_kernel_key, combine_code, config.num_of_nodes);
     
     // Cast the function pointer to the correct type
     using CombineFuncPtr = void (*)(hybrid_ep::combine_kernel_param_t, cudaStream_t);

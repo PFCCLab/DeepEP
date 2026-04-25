@@ -15,10 +15,11 @@ torch::Tensor Executor::allgather_routing_map(
 ){
     nvtxRangePushA("allgather_routing_map in hybrid-ep");
 
-    auto torch_distributed = py::module_::import("torch.distributed");
+    // Import paddle.distributed directly (goes through paddle runtime, not torch)
+    auto paddle_distributed = py::module_::import("paddle.distributed");
     auto num_of_expert = local_routing_map.size(-1);
     auto num_of_tokens_per_rank = local_routing_map.size(-2);
-    auto group_size = process_group.attr("size")().cast<int>();
+    auto group_size = process_group.attr("world_size").cast<int>();
     assert(num_of_expert == config.num_of_experts_per_rank * config.num_of_ranks_per_node * config.num_of_nodes);
 
     torch::Tensor global_routing_map;
@@ -28,7 +29,7 @@ torch::Tensor Executor::allgather_routing_map(
             {num_of_tokens_per_rank * group_size, num_of_expert},
             torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA)
         );
-        torch_distributed.attr("all_gather_into_tensor")(global_routing_map, local_routing_map, process_group);
+        paddle_distributed.attr("stream").attr("all_gather")(global_routing_map, local_routing_map, process_group, py::arg("sync_op") = true);
     } else { // At intra-node case, we will use custom allgather
         allgather_obj.launch(local_routing_map, /*NUM_OF_SMS=*/32, at::cuda::getCurrentCUDAStream());
         global_routing_map = torch::from_blob(

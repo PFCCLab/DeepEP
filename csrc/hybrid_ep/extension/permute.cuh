@@ -2,11 +2,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 #pragma once
-#include <ATen/cuda/CUDAContext.h>
+// #include <ATen/cuda/CUDAContext.h>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <torch/torch.h>
+#include <c10/util/Optional.h>
+// #include <torch/torch.h>
+#include <torch/python.h>
 #include <cub/cub.cuh>
 #include <type_traits>
 #include "utils.cuh"
