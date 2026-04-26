@@ -3,12 +3,16 @@
 import torch
 import os
 import shutil
-import hybrid_ep_cpp
 import warnings
 import contextlib
 import time
 from paddle.distributed.communication.group import Group
 import paddle
+
+from .runtime_paths import configure_runtime_paths, detect_runtime_paths
+
+configure_runtime_paths()
+import hybrid_ep_cpp
 
 def indices_to_map(
     topk_idx: torch.Tensor,
@@ -171,6 +175,7 @@ class HybridEPBuffer:
             print(f"The buffer config is not valid. hidden_dim={hidden_dim}, max_num_of_tokens_per_rank={max_num_of_tokens_per_rank}, num_local_experts={num_local_experts}, self.config.num_of_ranks_per_node={self.config.num_of_ranks_per_node}, self.config.num_of_nodes={self.config.num_of_nodes}, use_fp8={use_fp8}")
             raise ValueError("The buffer config is not valid.")
       
+        runtime_paths = detect_runtime_paths()
         # Create C++ buffer - this will allocate all buffers during construction
         self.runtime = hybrid_ep_cpp.HybridEPBuffer(
             self.group,
@@ -184,7 +189,10 @@ class HybridEPBuffer:
             # Disable custom allgather by default because its data layout is incompatible with scan kernel
             # The custom allgather kernel produces token-interleaved layout, but scan kernel expects
             # the standard allgather layout (rank-blocked layout)
-            enable_custom_allgather = False  # Always use standard allgather for correctness
+            enable_custom_allgather = False,  # Always use standard allgather for correctness
+            cuda_home = runtime_paths.cuda_home or "",
+            rdma_include_dir = runtime_paths.rdma_include_dir or "",
+            rdma_library_dir = runtime_paths.rdma_library_dir or "",
         )
 
     def empty_jit_cache(self):

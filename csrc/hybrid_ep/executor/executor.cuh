@@ -16,7 +16,9 @@
 
 class Executor {
 public:
-    Executor(int local_rank, int node_rank, std::string base_path, std::string comm_id, bool load_cached_kernels, bool enable_custom_allgather);
+    Executor(int local_rank, int node_rank, std::string base_path, std::string comm_id,
+             bool load_cached_kernels, bool enable_custom_allgather, std::string cuda_home,
+             std::string rdma_include_dir, std::string rdma_library_dir);
 
     struct DispatchArgs {
         // Input tensors
@@ -108,4 +110,3 @@ private:
     int node_rank;
     bool enable_custom_allgather;
 };
-

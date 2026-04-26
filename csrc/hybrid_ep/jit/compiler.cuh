@@ -24,7 +24,8 @@
 class NVCCCompiler{
 public:
     // Init the flags required by nvcc compiler
-    NVCCCompiler(std::string base_path, std::string comm_id);
+    NVCCCompiler(std::string base_path, std::string comm_id, std::string cuda_home,
+                 std::string rdma_include_dir, std::string rdma_library_dir);
 
     // Generate the code for jit compile
     std::string get_metadata_preprocessing_code(HybridEpConfigInstance config);
@@ -66,7 +67,9 @@ private:
 
 class KernelCache{
 public:
-    KernelCache(int node_rank, int local_rank, std::string base_path, std::string comm_id, bool load_cached_kernels);
+    KernelCache(int node_rank, int local_rank, std::string base_path, std::string comm_id,
+                bool load_cached_kernels, std::string cuda_home, std::string rdma_include_dir,
+                std::string rdma_library_dir);
 
     void run_proprecess_kernel(
         HybridEpConfigInstance config,

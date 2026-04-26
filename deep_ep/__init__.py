@@ -1,6 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import torch
 
+from .runtime_paths import configure_runtime_paths
+
+configure_runtime_paths()
+
 from .utils import EventOverlap, get_event_from_comm_stream
 from .buffer import Buffer
 from .hybrid_ep_buffer import HybridEPBuffer

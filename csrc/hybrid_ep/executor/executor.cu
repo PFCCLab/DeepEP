@@ -5,7 +5,28 @@
 #include <vector>
 #include <cstdint>
 
-Executor::Executor(int local_rank, int node_rank, std::string base_path, std::string comm_id, bool load_cached_kernels, bool enable_custom_allgather) : local_rank(local_rank), node_rank(node_rank), kernel_cache(node_rank, local_rank, base_path, comm_id, load_cached_kernels), enable_custom_allgather(enable_custom_allgather) {}  
+Executor::Executor(
+    int local_rank,
+    int node_rank,
+    std::string base_path,
+    std::string comm_id,
+    bool load_cached_kernels,
+    bool enable_custom_allgather,
+    std::string cuda_home,
+    std::string rdma_include_dir,
+    std::string rdma_library_dir)
+    : local_rank(local_rank),
+      node_rank(node_rank),
+      kernel_cache(
+          node_rank,
+          local_rank,
+          base_path,
+          comm_id,
+          load_cached_kernels,
+          cuda_home,
+          rdma_include_dir,
+          rdma_library_dir),
+      enable_custom_allgather(enable_custom_allgather) {}
 
 torch::Tensor Executor::allgather_routing_map(
     CustomAllgather &allgather_obj,
@@ -393,4 +414,3 @@ void Executor::combine_postprocess(HybridEpConfigInstance config, CombineBuffers
     // No postprocess is needed for the combine kernel now.
     nvtxRangePop();  // End of combine_postprocess nvtx range
 }
-

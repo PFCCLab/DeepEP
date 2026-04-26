@@ -121,7 +121,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         });
   
     pybind11::class_<HybridEPBuffer>(m, "HybridEPBuffer", py::module_local())
-        .def(py::init<py::object, BufferConfig, int, int, int, std::string, bool, bool, bool>(),
+        .def(py::init<py::object, BufferConfig, int, int, int, std::string, bool, bool, bool, std::string, std::string, std::string>(),
             py::arg("process_group"),
             py::arg("config"),
             py::arg("local_rank"),
@@ -130,7 +130,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("base_path"),
             py::arg("load_cached_kernels") = false,
             py::arg("use_shared_buffer") = true,
-            py::arg("enable_custom_allgather") = true)
+            py::arg("enable_custom_allgather") = true,
+            py::arg("cuda_home") = "",
+            py::arg("rdma_include_dir") = "",
+            py::arg("rdma_library_dir") = "")
         .def("update_buffer", &HybridEPBuffer::update_buffer, py::arg("config"))
         .def("metadata_preprocessing", &HybridEPBuffer::metadata_preprocessing,
              py::kw_only(), py::arg("config"), py::arg("routing_map"), py::arg("num_of_tokens_per_rank"), py::arg("non_blocking") = false)

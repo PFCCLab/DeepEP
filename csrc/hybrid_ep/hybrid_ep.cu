@@ -40,14 +40,26 @@ HybridEPBuffer::HybridEPBuffer(
   std::string base_path,
   bool load_cached_kernels,
   bool use_shared_buffer,
-  bool enable_custom_allgather
+  bool enable_custom_allgather,
+  std::string cuda_home,
+  std::string rdma_include_dir,
+  std::string rdma_library_dir
 ) : process_group(process_group), 
     buffer_config(config), 
     local_rank(local_rank), 
     node_rank(node_rank), 
     group_size(group_size), 
     use_shared_buffer(use_shared_buffer),
-    executor(local_rank, node_rank, base_path, get_comm_id(process_group), load_cached_kernels, enable_custom_allgather) 
+    executor(
+        local_rank,
+        node_rank,
+        base_path,
+        get_comm_id(process_group),
+        load_cached_kernels,
+        enable_custom_allgather,
+        cuda_home,
+        rdma_include_dir,
+        rdma_library_dir)
 {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());

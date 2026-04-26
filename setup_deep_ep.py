@@ -68,7 +68,9 @@ def get_extension_deep_ep_cpp():
     include_dirs = ['csrc/']
     library_dirs = []
     nvcc_dlink = []
-    extra_link_args = ['-lcuda']
+    # Paddle's Linux extension builder links cudart automatically, but CUDA
+    # relocatable device code also needs the device runtime at final link.
+    extra_link_args = ['-lcuda', '-lcudadevrt']
 
     # NVSHMEM flags
     if disable_nvshmem:
