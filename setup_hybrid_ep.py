@@ -13,6 +13,7 @@ from paddle.utils.cpp_extension import BuildExtension, CUDAExtension, _get_cuda_
 from paddle.utils.cpp_extension.extension_utils import (
     add_compile_flag,
 )
+from setup_utils import resolve_cuda_arch
 
 def collect_package_files(package: str, relative_dir: str):
     base_path = Path(package) / relative_dir
@@ -134,8 +135,7 @@ def get_extension_hybrid_ep_cpp():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     enable_multinode = os.getenv("HYBRID_EP_MULTINODE", "0").strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
-    # Default to Blackwell series
-    os.environ['PADDLE_CUDA_ARCH_LIST'] = os.getenv('PADDLE_CUDA_ARCH_LIST', '10.0')
+    os.environ['PADDLE_CUDA_ARCH_LIST'] = resolve_cuda_arch(default='10.0')
 
     # Basic compile arguments
     compile_args = {

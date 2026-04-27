@@ -11,6 +11,7 @@ from paddle.utils.cpp_extension import BuildExtension, CUDAExtension, _get_cuda_
 from paddle.utils.cpp_extension.extension_utils import (
     add_compile_flag,
 )
+from setup_utils import resolve_cuda_arch, should_disable_aggressive_ptx
 
 def collect_package_files(package: str, relative_dir: str):
     base_path = Path(package) / relative_dir
@@ -42,6 +43,7 @@ def to_nvcc_gencode(s: str) -> str:
         arch = f"{int(major)}{int(minor)}{suf.lower()}"
         flags.append(f"-gencode=arch=compute_{arch},code=sm_{arch}")
     return " ".join(flags)
+
 
 def get_extension_deep_ep_cpp():
     disable_nvshmem = False
@@ -83,32 +85,24 @@ def get_extension_deep_ep_cpp():
         nvcc_dlink.extend(['-dlink', f'-L{nvshmem_dir}/lib', '-lnvshmem_device'])
         extra_link_args.extend([f'-l:{nvshmem_host_lib}', '-l:libnvshmem_device.a', f'-Wl,-rpath,{nvshmem_dir}/lib'])
 
-    if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
-        # Prefer A100
-        os.environ['PADDLE_CUDA_ARCH_LIST'] = os.getenv('PADDLE_CUDA_ARCH_LIST', '8.0')
+    os.environ['PADDLE_CUDA_ARCH_LIST'] = resolve_cuda_arch()
 
+    if int(os.getenv('DISABLE_SM90_FEATURES', 0)):
         # Disable some SM90 features: FP8, launch methods, and TMA
         cxx_flags.append('-DDISABLE_SM90_FEATURES')
         nvcc_flags.append('-DDISABLE_SM90_FEATURES')
 
         # Disable internode and low-latency kernels
         assert disable_nvshmem
-    else:
-        # Prefer H800 series
-        os.environ['PADDLE_CUDA_ARCH_LIST'] = os.getenv('PADDLE_CUDA_ARCH_LIST', '9.0')
-
-        # CUDA 12 flags
-        nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
-        
-        # Ensure device linking and CUDA device runtime when RDC is enabled
-        if '-rdc=true' in nvcc_flags and '-dlink' not in nvcc_dlink:
-            nvcc_dlink.append('-dlink')
 
     # CUDA 12 flags
     nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
+    # Ensure device linking and CUDA device runtime when RDC is enabled
+    if '-dlink' not in nvcc_dlink:
+        nvcc_dlink.append('-dlink')
 
     # Disable LD/ST tricks, as some CUDA version does not support `.L1::no_allocate`
-    if os.environ['PADDLE_CUDA_ARCH_LIST'].strip() != '9.0':
+    if should_disable_aggressive_ptx(os.environ['PADDLE_CUDA_ARCH_LIST']):
         assert int(os.getenv('DISABLE_AGGRESSIVE_PTX_INSTRS', 1)) == 1
         os.environ['DISABLE_AGGRESSIVE_PTX_INSTRS'] = '1'
 
