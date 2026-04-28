@@ -493,7 +493,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            std::optional<EventHandle>& previous_event,
                            bool async,
                            bool allocate_on_comm_stream,
-                           bool skip_x_record_stream) {
+                           bool skip_x_record_stream,
+                           int quant_group_size) {
     bool cached_mode = cached_rank_prefix_matrix.has_value();
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
@@ -556,15 +557,16 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     }
 
     // FP8 scales checks
-    float* x_scales_ptr = nullptr;
+    void* x_scales_ptr = nullptr;
     int num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
     if (x_scales.has_value()) {
         EP_HOST_ASSERT(x.element_size() == 1);
-        EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or x_scales->scalar_type() == torch::kInt);
+        EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or x_scales->scalar_type() == torch::kInt or
+                        x_scales->scalar_type() == torch::kByte);
         EP_HOST_ASSERT(x_scales->dim() == 2);
         EP_HOST_ASSERT(x_scales->size(0) == num_tokens);
         num_scales = x_scales->dim() == 1 ? 1 : static_cast<int>(x_scales->size(1));
-        x_scales_ptr = static_cast<float*>(x_scales->data_ptr());
+        x_scales_ptr = x_scales->data_ptr();
         scale_token_stride = static_cast<int>(x_scales->stride(0));
         scale_hidden_stride = static_cast<int>(x_scales->stride(1));
     }
@@ -674,7 +676,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     // Assign pointers
     topk_idx_t* recv_topk_idx_ptr = nullptr;
     float* recv_topk_weights_ptr = nullptr;
-    float* recv_x_scales_ptr = nullptr;
+    void* recv_x_scales_ptr = nullptr;
     if (topk_idx.has_value()) {
         recv_topk_idx = torch::empty({num_recv_tokens, num_topk}, topk_idx->options());
         recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
@@ -684,10 +686,11 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     if (x_scales.has_value()) {
         recv_x_scales = x_scales->dim() == 1 ? torch::empty({num_recv_tokens}, x_scales->options())
                                              : torch::empty({num_recv_tokens, num_scales}, x_scales->options());
-        recv_x_scales_ptr = static_cast<float*>(recv_x_scales->data_ptr());
+        recv_x_scales_ptr = recv_x_scales->data_ptr();
     }
 
     // Dispatch
+    int scale_elem_size = (quant_group_size == 32) ? sizeof(uint8_t) : sizeof(float);
     EP_HOST_ASSERT(
         num_ranks * num_ranks * sizeof(int) +                                                                     // Size prefix matrix
             num_channels * num_ranks * sizeof(int) +                                                              // Channel start offset
@@ -697,7 +700,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +                     // Source index buffer
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) +   // Top-k index buffer
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +        // Top-k weight buffer
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales        // FP8 scale buffer
+            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * scale_elem_size * num_scales      // FP8 scale buffer
         <= num_nvl_bytes);
     intranode::dispatch(recv_x.data_ptr(),
                         recv_x_scales_ptr,
@@ -726,7 +729,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         comm_stream,
                         config.num_sms,
                         config.num_max_nvl_chunked_send_tokens,
-                        config.num_max_nvl_chunked_recv_tokens);
+                        config.num_max_nvl_chunked_recv_tokens,
+                        quant_group_size);
 
     // Wait streams
     std::optional<EventHandle> event;

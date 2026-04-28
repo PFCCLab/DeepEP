@@ -76,14 +76,14 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
                             cudaStream_t stream);
 
 void dispatch(void* recv_x,
-              float* recv_x_scales,
+              void* recv_x_scales,
               int* recv_src_idx,
               topk_idx_t* recv_topk_idx,
               float* recv_topk_weights,
               int* recv_channel_offset,
               int* send_head,
               const void* x,
-              const float* x_scales,
+              const void* x_scales,
               const topk_idx_t* topk_idx,
               const float* topk_weights,
               const bool* is_token_in_rank,
@@ -102,7 +102,8 @@ void dispatch(void* recv_x,
               cudaStream_t stream,
               int num_sms,
               int num_max_send_tokens,
-              int num_recv_buffer_tokens);
+              int num_recv_buffer_tokens,
+              int quant_group_size);
 
 void cached_notify_combine(void** buffer_ptrs,
                            int* send_head,

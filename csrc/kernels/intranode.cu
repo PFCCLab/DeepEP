@@ -8,6 +8,13 @@ namespace deep_ep {
 
 namespace intranode {
 
+// Scale type selection based on quantization group size
+template <int kQuantGroupSize> struct ScaleType;
+template <> struct ScaleType<128> { using type = float; };
+template <> struct ScaleType<32> { using type = uint8_t; };
+template <int kQuantGroupSize>
+using scale_t = typename ScaleType<kQuantGroupSize>::type;
+
 template <int kNumRanks>
 __global__ void notify_dispatch(const int* num_tokens_per_rank,
                                 int* moe_recv_counter_mapped,
@@ -194,16 +201,16 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
-template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
+template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp, int kQuantGroupSize = 128>
 __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
-                                                           float* recv_x_scales,
+                                                           scale_t<kQuantGroupSize>* recv_x_scales,
                                                            int* recv_src_idx,
                                                            topk_idx_t* recv_topk_idx,
                                                            float* recv_topk_weights,
                                                            int* recv_channel_offset,
                                                            int* send_head,
                                                            const int4* x,
-                                                           const float* x_scales,
+                                                           const scale_t<kQuantGroupSize>* x_scales,
                                                            const topk_idx_t* topk_idx,
                                                            const float* topk_weights,
                                                            const bool* is_token_in_rank,
@@ -264,7 +271,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
     // `src_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(int)
     // `topk_idx_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(topk_idx_t)
     // `topk_weights_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(float)
-    // `x_scales_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_scales * sizeof(float)
+    // `x_scales_buffers`: kNumChannels * kNumRanks * num_recv_buffer_tokens * num_scales * sizeof(scale_t<kQuantGroupSize>)
     auto channel_x_buffers = Buffer<int4>(
         ptr, num_channels_total * num_recv_buffer_tokens * hidden_int4, channel_rank_offset * num_recv_buffer_tokens * hidden_int4);
     auto channel_src_idx_buffers =
@@ -273,7 +280,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
     auto channel_topk_weights_buffers =
         Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk, channel_rank_offset * num_recv_buffer_tokens * num_topk);
-    auto channel_x_scales_buffers = Buffer<float>(
+    auto channel_x_scales_buffers = Buffer<scale_t<kQuantGroupSize>>(
         ptr, num_channels_total * num_recv_buffer_tokens * num_scales, channel_rank_offset * num_recv_buffer_tokens * num_scales);
 
     // TMA stuffs
@@ -532,14 +539,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 }
 
 void dispatch(void* recv_x,
-              float* recv_x_scales,
+              void* recv_x_scales,
               int* recv_src_idx,
               topk_idx_t* recv_topk_idx,
               float* recv_topk_weights,
               int* recv_channel_offset,
               int* send_head,
               const void* x,
-              const float* x_scales,
+              const void* x_scales,
               const topk_idx_t* topk_idx,
               const float* topk_weights,
               const bool* is_token_in_rank,
@@ -558,7 +565,8 @@ void dispatch(void* recv_x,
               cudaStream_t stream,
               int num_sms,
               int num_max_send_tokens,
-              int num_recv_buffer_tokens) {
+              int num_recv_buffer_tokens,
+              int quant_group_size) {
     constexpr int kNumThreads = 768;
     constexpr int kNumTMABytesPerWarp = 8192;
 #ifndef DISABLE_SM90_FEATURES
@@ -568,45 +576,58 @@ void dispatch(void* recv_x,
     // Make sure never OOB
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
 
-#define DISPATCH_LAUNCH_CASE(ranks)                                      \
-    {                                                                    \
-        auto kernel = dispatch<ranks, kNumThreads, kNumTMABytesPerWarp>; \
-        SET_SHARED_MEMORY_FOR_TMA(kernel);                               \
-        LAUNCH_KERNEL(&cfg,                                              \
-                      kernel,                                            \
-                      reinterpret_cast<int4*>(recv_x),                   \
-                      recv_x_scales,                                     \
-                      recv_src_idx,                                      \
-                      recv_topk_idx,                                     \
-                      recv_topk_weights,                                 \
-                      recv_channel_offset,                               \
-                      send_head,                                         \
-                      reinterpret_cast<const int4*>(x),                  \
-                      x_scales,                                          \
-                      topk_idx,                                          \
-                      topk_weights,                                      \
-                      is_token_in_rank,                                  \
-                      channel_prefix_matrix,                             \
-                      num_tokens,                                        \
-                      num_worst_tokens,                                  \
-                      hidden_int4,                                       \
-                      num_topk,                                          \
-                      num_experts,                                       \
-                      num_scales,                                        \
-                      scale_token_stride,                                \
-                      scale_hidden_stride,                               \
-                      buffer_ptrs,                                       \
-                      rank,                                              \
-                      num_max_send_tokens,                               \
-                      num_recv_buffer_tokens);                           \
-    }                                                                    \
+#define DISPATCH_LAUNCH_CASE(group_size, ranks)                                      \
+    {                                                                                \
+        auto kernel = dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, group_size>; \
+        SET_SHARED_MEMORY_FOR_TMA(kernel);                                           \
+        LAUNCH_KERNEL(&cfg,                                                          \
+                      kernel,                                                        \
+                      reinterpret_cast<int4*>(recv_x),                               \
+                      reinterpret_cast<scale_t<group_size>*>(recv_x_scales),         \
+                      recv_src_idx,                                                  \
+                      recv_topk_idx,                                                 \
+                      recv_topk_weights,                                             \
+                      recv_channel_offset,                                           \
+                      send_head,                                                     \
+                      reinterpret_cast<const int4*>(x),                              \
+                      reinterpret_cast<const scale_t<group_size>*>(x_scales),        \
+                      topk_idx,                                                      \
+                      topk_weights,                                                  \
+                      is_token_in_rank,                                              \
+                      channel_prefix_matrix,                                         \
+                      num_tokens,                                                    \
+                      num_worst_tokens,                                              \
+                      hidden_int4,                                                   \
+                      num_topk,                                                      \
+                      num_experts,                                                   \
+                      num_scales,                                                    \
+                      scale_token_stride,                                            \
+                      scale_hidden_stride,                                           \
+                      buffer_ptrs,                                                   \
+                      rank,                                                          \
+                      num_max_send_tokens,                                           \
+                      num_recv_buffer_tokens);                                       \
+    }                                                                                \
     break
+
+#define DISPATCH_LAUNCH_CASE_128(ranks) DISPATCH_LAUNCH_CASE(128, ranks)
+#define DISPATCH_LAUNCH_CASE_32(ranks)  DISPATCH_LAUNCH_CASE(32, ranks)
 
     // Even-numbered blocks for sending, odd-numbered blocks for receiving.
     EP_HOST_ASSERT(num_sms % 2 == 0);
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
-    SWITCH_RANKS(DISPATCH_LAUNCH_CASE);
+
+    if (quant_group_size == 128) {
+        SWITCH_RANKS(DISPATCH_LAUNCH_CASE_128);
+    } else if (quant_group_size == 32) {
+        SWITCH_RANKS(DISPATCH_LAUNCH_CASE_32);
+    } else {
+        EP_HOST_ASSERT(false and "Unsupported quant_group_size for intranode dispatch");
+    }
+
 #undef DISPATCH_LAUNCH_CASE
+#undef DISPATCH_LAUNCH_CASE_128
+#undef DISPATCH_LAUNCH_CASE_32
 }
 
 template <int kNumRanks>
