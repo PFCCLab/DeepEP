@@ -6,3 +6,5 @@ build/
 .cache/
 .vscode/
 */cmake-build-*/
+deep_ep/backend/
+deep_ep.egg-info/
