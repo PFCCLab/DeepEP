@@ -332,9 +332,12 @@ class Buffer:
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
                  allocate_on_comm_stream: bool = False,
                  skip_x_record_stream: bool = False,
-                 quant_group_size: int = 128) -> \
+                 quant_group_size: int = 128,
+                 use_mask_prmt: bool = False,
+                 max_tokens_per_expert: int = 0) -> \
                  Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
-                    Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
+                    Optional[torch.Tensor], List[int], Tuple, EventOverlap,
+                    Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Dispatch tokens to different ranks, both intranode and internode settings are supported.
         Intranode kernels require all the ranks should be visible via NVLink.
@@ -389,24 +392,24 @@ class Buffer:
             assert topk_idx is None and topk_weights is None
             rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head = handle
             num_recv_tokens = recv_src_idx.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
+            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, event = self.runtime.intranode_dispatch(
                 x, x_scales, None, None, None, is_token_in_rank, None, num_recv_tokens, rank_prefix_matrix, channel_prefix_matrix,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
-                skip_x_record_stream, quant_group_size)
-            return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
+                skip_x_record_stream, quant_group_size, use_mask_prmt, max_tokens_per_expert)
+            return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event), None, None
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
-            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, event = \
+            recv_x, recv_x_scales, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, send_head, permuted_indice_map, token_nums_per_expert, event = \
                 self.runtime.intranode_dispatch(x, x_scales, topk_idx, topk_weights,
                                                 num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, 0, None, None,
                                                 expert_alignment, num_worst_tokens, config,
                                                 getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
-                                                skip_x_record_stream, quant_group_size)
+                                                skip_x_record_stream, quant_group_size, use_mask_prmt, max_tokens_per_expert)
             handle = (rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)
             return (
                 recv_x, recv_x_scales
             ) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, EventOverlap(
-                event)
+                event), permuted_indice_map, token_nums_per_expert
 
     # noinspection PyTypeChecker
     def combine(self, x: torch.Tensor, handle: Tuple,

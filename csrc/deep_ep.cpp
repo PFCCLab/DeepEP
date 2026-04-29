@@ -476,6 +476,8 @@ std::tuple<torch::Tensor,
            torch::Tensor,
            torch::Tensor,
            torch::Tensor,
+           std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
            std::optional<EventHandle>>
 Buffer::intranode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& x_scales,
@@ -494,7 +496,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            bool async,
                            bool allocate_on_comm_stream,
                            bool skip_x_record_stream,
-                           int quant_group_size) {
+                           int quant_group_size,
+                           bool use_mask_prmt,
+                           int max_tokens_per_expert) {
     bool cached_mode = cached_rank_prefix_matrix.has_value();
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
@@ -538,6 +542,15 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_experts = cached_mode ? 0 : static_cast<int>(num_tokens_per_expert->size(0)), num_local_experts = num_experts / num_ranks;
+
+    // use_mask_prmt checks
+    if (use_mask_prmt) {
+        EP_HOST_ASSERT(quant_group_size == 32);
+        EP_HOST_ASSERT(x_scales.has_value());
+        EP_HOST_ASSERT(topk_idx.has_value());
+        EP_HOST_ASSERT(max_tokens_per_expert > 0);
+        EP_HOST_ASSERT(num_local_experts > 0);
+    }
 
     // Top-k checks
     int num_topk = 0;
@@ -666,12 +679,19 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     }
 
     // Allocate new tensors
-    auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    // When use_mask_prmt: recv_x is [E*M, hidden], recv_x_scales is [E, M, kb_dim] uint8 (SfAtom layout)
+    auto recv_x = use_mask_prmt
+                      ? torch::empty({num_local_experts * max_tokens_per_expert, hidden}, x.options())
+                      : torch::empty({num_recv_tokens, hidden}, x.options());
     auto recv_src_idx = torch::empty({num_recv_tokens}, dtype(torch::kInt32).device(torch::kCUDA));
     auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(),
          recv_x_scales = std::optional<torch::Tensor>();
     auto recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
     auto send_head = torch::empty({num_tokens, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+
+    // Mask PMRT additional tensors
+    auto permuted_indice_map_tensor = std::optional<torch::Tensor>();
+    auto token_nums_per_expert_tensor = std::optional<torch::Tensor>();
 
     // Assign pointers
     topk_idx_t* recv_topk_idx_ptr = nullptr;
@@ -684,9 +704,21 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
     }
     if (x_scales.has_value()) {
-        recv_x_scales = x_scales->dim() == 1 ? torch::empty({num_recv_tokens}, x_scales->options())
-                                             : torch::empty({num_recv_tokens, num_scales}, x_scales->options());
+        if (use_mask_prmt) {
+            // SfAtom layout: output_scale [E, M, kb_dim] as uint8
+            int hidden_scale = static_cast<int>(x_scales->size(1)) / 4;
+            int kb_dim_val = hidden_scale * 4;
+            recv_x_scales = torch::empty({num_local_experts, max_tokens_per_expert, kb_dim_val},
+                                          dtype(torch::kByte).device(torch::kCUDA));
+        } else {
+            recv_x_scales = x_scales->dim() == 1 ? torch::empty({num_recv_tokens}, x_scales->options())
+                                                 : torch::empty({num_recv_tokens, num_scales}, x_scales->options());
+        }
         recv_x_scales_ptr = recv_x_scales->data_ptr();
+    }
+    if (use_mask_prmt) {
+        permuted_indice_map_tensor = torch::full({num_recv_tokens, num_topk}, -1, dtype(torch::kInt32).device(torch::kCUDA));
+        token_nums_per_expert_tensor = torch::zeros({num_local_experts}, dtype(torch::kInt32).device(torch::kCUDA));
     }
 
     // Dispatch
@@ -702,6 +734,13 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +        // Top-k weight buffer
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * scale_elem_size * num_scales      // FP8 scale buffer
         <= num_nvl_bytes);
+    // Compute hidden_scale and kb_dim for mask_pmrt
+    int hidden_scale = 0, kb_dim = 0;
+    if (use_mask_prmt) {
+        hidden_scale = static_cast<int>(x_scales->size(1)) / 4;
+        kb_dim = hidden_scale * 4;
+    }
+
     intranode::dispatch(recv_x.data_ptr(),
                         recv_x_scales_ptr,
                         recv_src_idx.data_ptr<int>(),
@@ -730,7 +769,14 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         config.num_sms,
                         config.num_max_nvl_chunked_send_tokens,
                         config.num_max_nvl_chunked_recv_tokens,
-                        quant_group_size);
+                        quant_group_size,
+                        use_mask_prmt,
+                        use_mask_prmt ? permuted_indice_map_tensor->data_ptr<int32_t>() : nullptr,
+                        use_mask_prmt ? token_nums_per_expert_tensor->data_ptr<int32_t>() : nullptr,
+                        max_tokens_per_expert,
+                        num_local_experts,
+                        hidden_scale,
+                        kb_dim);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -762,7 +808,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                          cached_rank_prefix_matrix,
                          recv_topk_idx,
                          recv_topk_weights,
-                         recv_x_scales}) {
+                         recv_x_scales,
+                         permuted_indice_map_tensor,
+                         token_nums_per_expert_tensor}) {
             to.has_value() ? to->record_stream(comm_stream) : void();
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
@@ -787,6 +835,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             recv_channel_prefix_matrix,
             recv_src_idx,
             send_head,
+            permuted_indice_map_tensor,
+            token_nums_per_expert_tensor,
             event};
 }
 

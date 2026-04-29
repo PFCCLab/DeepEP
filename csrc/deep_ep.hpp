@@ -177,6 +177,8 @@ public:
                torch::Tensor,
                torch::Tensor,
                torch::Tensor,
+               std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
                std::optional<EventHandle>>
     intranode_dispatch(const torch::Tensor& x,
                        const std::optional<torch::Tensor>& x_scales,
@@ -195,7 +197,9 @@ public:
                        bool async,
                        bool allocate_on_comm_stream,
                        bool skip_x_record_stream = false,
-                       int quant_group_size = 128);
+                       int quant_group_size = 128,
+                       bool use_mask_prmt = false,
+                       int max_tokens_per_expert = 0);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> intranode_combine(
         const torch::Tensor& x,

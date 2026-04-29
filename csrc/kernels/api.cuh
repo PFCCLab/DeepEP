@@ -103,7 +103,14 @@ void dispatch(void* recv_x,
               int num_sms,
               int num_max_send_tokens,
               int num_recv_buffer_tokens,
-              int quant_group_size);
+              int quant_group_size,
+              bool use_mask_prmt = false,
+              int32_t* permuted_indice_map = nullptr,
+              int32_t* token_nums_per_expert = nullptr,
+              int max_tokens_per_expert = 0,
+              int num_local_experts = 0,
+              int hidden_scale = 0,
+              int kb_dim = 0);
 
 void cached_notify_combine(void** buffer_ptrs,
                            int* send_head,
