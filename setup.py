@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import os
 import subprocess
 import shutil
 from pathlib import Path
@@ -7,8 +8,18 @@ import setuptools
 from paddle.utils.cpp_extension import BuildExtension
 from setuptools.command.build_ext import build_ext
 
-from setup_deep_ep import collect_package_files, get_extension_deep_ep_cpp
-from setup_hybrid_ep import get_extension_hybrid_ep_cpp
+from setup_hybrid_ep import collect_package_files, get_extension_hybrid_ep_cpp
+
+
+def env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {
+        "1",
+        "true",
+        "t",
+        "yes",
+        "y",
+        "on",
+    }
 
 
 def remove_runpath(shared_library: str) -> None:
@@ -67,10 +78,14 @@ def get_revision() -> str:
 
 
 if __name__ == "__main__":
-    ext_modules = [
-        get_extension_deep_ep_cpp(),
-        get_extension_hybrid_ep_cpp(),
-    ]
+    ext_modules = []
+    if env_flag_enabled("HYBRID_EP_SKIP_DEEP_EP"):
+        print("HYBRID_EP_SKIP_DEEP_EP=1: skip building deep_ep_cpp")
+    else:
+        from setup_deep_ep import get_extension_deep_ep_cpp
+
+        ext_modules.append(get_extension_deep_ep_cpp())
+    ext_modules.append(get_extension_hybrid_ep_cpp())
 
     setuptools.setup(
         name="deep_ep",
