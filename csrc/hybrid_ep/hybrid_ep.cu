@@ -7,9 +7,6 @@
 #include <functional>
 
 std::string get_comm_id(pybind11::object process_group) {
-  auto torch = pybind11::module_::import("torch");
-  auto torch_distributed = torch.attr("distributed");
-
   // Get the global id of each rank in the process group
   std::vector<int> global_ranks;
   int group_id = process_group.attr("id").cast<int>(); 
