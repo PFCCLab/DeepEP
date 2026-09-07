@@ -93,3 +93,44 @@ def get_buffer(group, hidden_bytes):
     )
     return buffer
 
+
+class AsyncLoad:
+    def __init__(self):
+        self._pin = None
+        self._event = None
+
+    def __call__(self, x, dtype=None) -> paddle.Tensor:
+        """Copy x to GPU asynchronously."""
+        assert self._pin is None, (
+            "The previous copy is not finished, call wait() first before reuse for another copy.")
+
+        cudart = paddle.cuda.cudart()
+        self._pin = paddle.to_tensor(x, dtype=dtype, place=paddle.CUDAPinnedPlace())
+
+        out = paddle.empty_like(self._pin)
+        stream = paddle.cuda.current_stream()
+
+        err = cudart.cudaMemcpyAsync(
+            out.data_ptr(),
+            self._pin.data_ptr(),
+            out.size * out.itemsize,
+            cudart.cudaMemcpyHostToDevice,
+            stream.stream_base.cuda_stream,
+        )
+        assert err == cudart.cudaError.success, f"cudaMemcpyAsync failed: {err}"
+
+        # the pinned tensor cannot be freed before the copy event is done
+        if self._event is None:
+            self._event = paddle.cuda.Event()
+        self._event.record()
+
+        return out
+
+    def wait(self):
+        """Wait the current copy to finish and free the pinned tensor."""
+        if self._pin is not None:
+            self._event.synchronize()
+            self._pin = None
+
+    def __del__(self):
+        self.wait()
