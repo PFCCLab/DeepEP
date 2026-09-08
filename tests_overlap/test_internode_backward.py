@@ -1,7 +1,3 @@
-import os
-import sys
-from typing import NamedTuple
-
 import paddle
 from paddle import Tensor
 import paddle.distributed as dist
@@ -20,7 +16,7 @@ print("deep_gemm:", deep_gemm.__file__)
 
 from utils import initialize_fleet, configure_buffer, get_buffer, AsyncLoad
 
-# 使用特别编译的注释掉所有第三方库的版本, 不然会和开发中的 deep_ep/deep_gemm 冲突
+# 使用特别编译的注释掉 deep_ep/deep_gemm 的版本, 否则会头文件冲突
 import paddlefleet_ops
 assert not paddlefleet_ops._DEEP_EP_AVAILABLE
 assert not paddlefleet_ops._DEEP_GEMM_AVAILABLE
@@ -36,9 +32,11 @@ CALC_NUM_SMS = 100
 
 ALIGNMENT = 128
 CHUNK = 4096
-FUSE_SWIGLU = True
-PRECISE_SWIGLU = False
+FUSED_SWIGLU = False
+PRECISE_SWIGLU = True
+INTERLEAVED = False
 OVERLAP_WGRAD = True
+ORDERED_WGRAD = True
 
 
 def prepare_case_inputs(group):
@@ -80,7 +78,7 @@ def run_wgrad(tokens_per_expert, x, do1, w_gateup_grad, o2, do3, w_down_grad):
 
 
 def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, w_gateup, w_down,
-                w_gateup_grad, w_down_grad):
+                w_gateup_grad, w_down_grad, logging=False):
     num_experts = group.world_size * E
     deep_gemm.set_num_sms(CALC_NUM_SMS)
     paddle.base.core.nvprof_nvtx_push("forward")
@@ -124,9 +122,10 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
     num_tasks = len(task_queue)
     num_recv_tokens = len(recv_x)
 
-    print("tokens_per_expert:", tokens_per_expert)
-    print("num_tasks:", [(n + CHUNK - 1) // CHUNK for n in tokens_per_expert], "=", num_tasks)
-    print("num_recv_tokens:", num_recv_tokens)
+    if logging:
+        print("tokens_per_expert:", tokens_per_expert)
+        print("num_tasks:", [(n + CHUNK - 1) // CHUNK for n in tokens_per_expert], "=", num_tasks)
+        print("num_recv_tokens:", num_recv_tokens)
 
     ############################### GEMM FORWARD ###############################
 
@@ -147,8 +146,8 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
         paddle.base.core.nvprof_nvtx_push(f"task_{task_idx}")
         deep_gemm.bf16_chunk_gemm_nn(
             unzipped_tokens, w_gateup, o1, task_queue, task_idx,
-            **(dict(o2=o2, probs=unzipped_probs) if FUSE_SWIGLU else {}))
-        if not FUSE_SWIGLU:
+            **(dict(o2=o2, probs=unzipped_probs) if FUSED_SWIGLU else {}))
+        if not FUSED_SWIGLU:
             deep_gemm.chunk_weighted_swiglu(
                 o1, unzipped_probs, o2, task_queue, task_idx, precise=PRECISE_SWIGLU)
         deep_gemm.bf16_chunk_gemm_nn(o2, w_down, o3, task_queue, task_idx)
@@ -157,12 +156,12 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
         paddle.base.core.nvprof_nvtx_pop()
 
         if not full_compute and task_idx >= num_tasks * 0.2:
-            print(f"switch to full compute at {task_idx}/{num_tasks}")
+            print(f"switch to full compute at {task_idx}/{num_tasks}") if logging else ()
             full_compute = True
             deep_gemm.set_num_sms(CALC_NUM_SMS + COMM_NUM_SMS)
 
         if combine_event is None and task_idx >= num_tasks * 0.7:
-            print(f"capture combine_event at {task_idx}/{num_tasks}")
+            print(f"capture combine_event at {task_idx}/{num_tasks}") if logging else ()
             combine_event = deep_ep.Buffer.capture()
             deep_gemm.set_num_sms(CALC_NUM_SMS)
 
@@ -220,19 +219,20 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
         deep_gemm.bf16_chunk_gemm_nt(do3, w_down, do2, task_queue_bwd, task_idx)
         deep_gemm.chunk_weighted_swiglu_grad(
             o1, unzipped_probs, do2, o2_bwd, do1, drecv_probs, atomic_to_zip_bwd, zip_to_atomic,
-            recv_token_indices, task_queue_bwd, task_idx, precise=PRECISE_SWIGLU)
+            recv_token_indices, task_queue_bwd, task_idx, CHUNK, precise=PRECISE_SWIGLU,
+            interleaved=INTERLEAVED)
         deep_gemm.bf16_chunk_gemm_nt(do1, w_gateup, dx, task_queue_bwd, task_idx)
         deep_gemm.chunk_zip(dx, drecv_x, atomic_to_zip_bwd, zip_to_atomic_bwd, recv_token_indices,
                             num_valid_topk, token_done, zip_done, task_queue_bwd, task_idx, CHUNK)
         paddle.base.core.nvprof_nvtx_pop()
 
         if not full_compute and task_idx >= num_tasks * 0.2:
-            print(f"switch to full compute at {task_idx}/{num_tasks}")
+            print(f"switch to full compute at {task_idx}/{num_tasks}") if logging else ()
             full_compute = True
             deep_gemm.set_num_sms(CALC_NUM_SMS + COMM_NUM_SMS)
 
         if combine_event is None and task_idx >= num_tasks * 0.7:
-            print(f"capture combine_event at {task_idx}/{num_tasks}")
+            print(f"capture combine_event at {task_idx}/{num_tasks}") if logging else ()
             combine_event = deep_ep.Buffer.capture()
             deep_gemm.set_num_sms(CALC_NUM_SMS)
 
@@ -242,8 +242,35 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
         drecv_x, handle, drecv_probs, async_finish=OVERLAP_WGRAD, previous_event=combine_event,
         allocate_on_comm_stream=False, zip_done=zip_done)
 
-    run_wgrad(tokens_per_expert, unzipped_tokens, do1, w_gateup_grad, o2_bwd, do3, w_down_grad)
+    ################################## WGRAD ###################################
 
+    paddle.base.core.nvprof_nvtx_push("wgrad")
+
+    if ORDERED_WGRAD:
+        m_start = [0]
+        for n in tokens_per_expert:
+            m_start.append(m_start[-1] + align(n))
+        async_load = AsyncLoad()
+        m_start = async_load(m_start, dtype="int32")
+
+        # x 从 recv_x 中解压, 这里使用 gather 并非最优性能, 因为重复读了 recv_x 的某些行
+        ordered_to_zip = deep_gemm.sort_unzip_map(
+            zip_to_atomic_bwd, m_start, num_unzipped_tokens)
+        x_wgrad = deep_gemm.token_gather(recv_x, ordered_to_zip)
+
+        # do1/o2_bwd/do3 从反向 atomic 序的输入重排序为标准 unzip 序
+        ordered_to_atomic = deep_gemm.sort_atomic_map(
+            zip_to_atomic_bwd, m_start, num_unzipped_tokens)
+        do1_wgrad = deep_gemm.token_gather(do1, ordered_to_atomic)
+        o2_bwd = deep_gemm.token_gather(o2_bwd, ordered_to_atomic)
+        do3 = deep_gemm.token_gather(do3, ordered_to_atomic)
+    else:
+        x_wgrad = deep_gemm.token_gather(recv_x, atomic_to_zip_bwd)
+        do1_wgrad = do1
+
+    run_wgrad(tokens_per_expert, x_wgrad, do1_wgrad, w_gateup_grad, o2_bwd, do3, w_down_grad)
+
+    paddle.base.core.nvprof_nvtx_pop()
     event.current_stream_wait() if OVERLAP_WGRAD else ()
 
     paddle.zeros([1])
@@ -291,7 +318,6 @@ def run_baseline(group, buffer, hidden_states, token_probs, token_indices, dout,
 
     tokens_per_expert = num_recv_tokens_per_expert_list
     recv_token_indices = recv_token_indices.cast("int32")
-    print("tokens_per_expert:", tokens_per_expert)
 
     m_indices = paddle.concat(
         [paddle.full([align(n)], i, "int32") for i, n in enumerate(tokens_per_expert)])
@@ -407,10 +433,18 @@ def check(out, ref, perm, offset):
 
 
 def interleave_gateup(gateup):
+    if not INTERLEAVED:
+        return gateup
     gate, up = gateup.chunk(2, axis=-1)
     return paddle.concat(
         [gate.unsqueeze(-1), up.unsqueeze(-1)], axis=-1
     ).reshape(gateup.shape)
+
+
+def deinterleave_gateup(gateup):
+    if not INTERLEAVED:
+        return gateup
+    return paddle.concat([gateup[..., 0::2], gateup[..., 1::2]], axis=-1)
 
 
 def check(x, y):
@@ -438,7 +472,7 @@ def main():
     buffer = get_buffer(group, H * 2)
     x, token_probs, token_indices, w_gateup, w_down = prepare_case_inputs(group)
     dout = paddle.randn_like(x)
-    w_gateup_interleaved = interleave_gateup(w_gateup)
+    w_gateup_ref = deinterleave_gateup(w_gateup)
 
     # wgrad 使用累加语义, 需要提前置 0
     w_gateup_grad = paddle.zeros(w_gateup.shape, dtype="float32")
@@ -450,17 +484,17 @@ def main():
 
     # validate
     out, do1, dx, dprobs, tokens_per_expert, atomic_to_zip = run_overlap(
-        group, buffer, x, token_probs, token_indices, dout, w_gateup_interleaved, w_down,
-        w_gateup_grad, w_down_grad)
+        group, buffer, x, token_probs, token_indices, dout, w_gateup, w_down,
+        w_gateup_grad, w_down_grad, logging=True)
     out_ref, do1_ref, dx_ref, dprobs_ref = run_baseline(
-        group, buffer, x, token_probs, token_indices, dout, w_gateup, w_down, w_gateup_grad_ref,
-        w_down_grad_ref)
+        group, buffer, x, token_probs, token_indices, dout, w_gateup_ref, w_down,
+        w_gateup_grad_ref, w_down_grad_ref)
 
     atomic_perm = get_atomic_perm(tokens_per_expert, atomic_to_zip)
 
     print("out:", check(out, out_ref))
     print("do1:", check(do1[atomic_perm], interleave_gateup(do1_ref)))
-    print("dx:", check(dx, dx_ref))  # gateup interleave 累加顺序不同
+    print("dx:", check(dx, dx_ref))
     print("dprobs:", check(dprobs, dprobs_ref))
     print("w_gateup_grad:", check(w_gateup_grad, interleave_gateup(w_gateup_grad_ref)))
     print("w_down_grad:", check(w_down_grad, w_down_grad_ref))
@@ -471,13 +505,13 @@ def main():
 
     for i in range(5):
         paddle.base.core.nvprof_nvtx_push(f"overlap_{i}")
-        run_overlap(group, buffer, x, token_probs, token_indices, dout, w_gateup_interleaved,
-                    w_down, w_gateup_grad, w_down_grad)
+        run_overlap(group, buffer, x, token_probs, token_indices, dout, w_gateup, w_down,
+                    w_gateup_grad, w_down_grad)
         paddle.base.core.nvprof_nvtx_pop()
 
     for i in range(5):
         paddle.base.core.nvprof_nvtx_push(f"baseline_{i}")
-        run_baseline(group, buffer, x, token_probs, token_indices, dout, w_gateup, w_down,
+        run_baseline(group, buffer, x, token_probs, token_indices, dout, w_gateup_ref, w_down,
                      w_gateup_grad_ref, w_down_grad_ref)
         paddle.base.core.nvprof_nvtx_pop()
 
