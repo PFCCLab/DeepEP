@@ -134,3 +134,35 @@ class AsyncLoad:
 
     def __del__(self):
         self.wait()
+
+
+def grouped_launch(funcs, begin, end, calc_stream, comm_stream, event=None):
+    """
+    轮流在 calc/comm 两个 stream 上对 funcs 进行分组发射.
+
+    使用两个 stream 可以让前后两个 kernel 重叠, 让下一个 kernel 充分利用上一个 kernel
+    的尾部空出来的 SM, 达到类似 group_gemm 的效果.
+    """
+    if event is None:
+        event = paddle.cuda.Event()
+
+    # 对于每组 func，总是从 calc_stream 开始发射，这样同一个 task_idx 的前后 func
+    # 必定在同一个 stream 上，可以天然保证同步
+    stream_bases = [calc_stream.stream_base, comm_stream.stream_base]
+    i = 0
+
+    for n, func in enumerate(funcs):
+        # 每组 func 开始前让 comm_stream 等待一次 calc_stream, 保持组的边界
+        # 其实从正确性上没有必要, 只是让 timeline 更整齐, 对性能影响未知
+        event.record()
+        comm_stream.wait_event(event)
+
+        paddle.base.core.nvprof_nvtx_push(f"G{n}")
+        for i, task_idx in enumerate(range(begin, end)):
+            # 直接调用 core 比用 stream_guard 开销更低, 这里的发射速度非常关键
+            paddle.base.core._set_current_stream(stream_bases[i % 2])
+            func(task_idx)
+        paddle.base.core.nvprof_nvtx_pop()
+
+    if i % 2 != 0:
+        paddle.base.core._set_current_stream(stream_bases[0])
