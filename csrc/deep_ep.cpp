@@ -958,6 +958,7 @@ std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
            std::optional<EventHandle>>
 Buffer::internode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& x_scales,
@@ -1239,6 +1240,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     // NOTES: each local expert owns a `unzip_alignment`-aligned region of `unzipped_x`, and the receivers
     // atomically grab slots inside it, so the intra-region order is non-deterministic
     auto unzipped_x = std::optional<torch::Tensor>();
+    auto unzipped_scales = std::optional<torch::Tensor>();
     auto unzipped_probs = std::optional<torch::Tensor>();
     auto unzipped_expert_counter = std::optional<torch::Tensor>();
     auto unzip_expert_meta = std::optional<torch::Tensor>();
@@ -1269,6 +1271,11 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         unzipped_x = torch::empty({num_unzipped_tokens, hidden}, x.options());
         unzipped_probs = torch::empty({num_unzipped_tokens}, dtype(torch::kFloat32).device(torch::kCUDA));
         unzip_expert_meta = torch::empty({num_local_experts, 3}, dtype(torch::kInt32).device(torch::kCUDA));
+
+        if (x_scales.has_value()) {
+            unzipped_scales = x_scales->dim() == 1 ? torch::empty({num_unzipped_tokens}, x_scales->options())
+                                                   : torch::empty({num_unzipped_tokens, num_scales}, x_scales->options());
+        }
 
         // Both mapping tables are only assigned for the slots that are actually claimed, so the
         // padding and the invalid `topk` positions have to be pre-filled with -1
@@ -1341,6 +1348,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         num_channels,
                         low_latency_mode,
                         unzipped_x.has_value() ? unzipped_x->data_ptr() : nullptr,
+                        unzipped_scales.has_value() ? static_cast<float*>(unzipped_scales->data_ptr()) : nullptr,
                         unzipped_probs.has_value() ? unzipped_probs->data_ptr<float>() : nullptr,
                         unzipped_expert_counter.has_value() ? unzipped_expert_counter->data_ptr<int>() : nullptr,
                         unzip_expert_meta.has_value() ? unzip_expert_meta->data_ptr<int>() : nullptr,
@@ -1386,6 +1394,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                          send_nvl_head,
                          recv_src_meta,
                          unzipped_x,
+                         unzipped_scales,
                          unzipped_probs,
                          atomic_to_zip,
                          zip_to_atomic,
@@ -1426,6 +1435,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
             send_rdma_head,
             send_nvl_head,
             unzipped_x,
+            unzipped_scales,
             unzipped_probs,
             atomic_to_zip,
             zip_to_atomic,

@@ -378,6 +378,8 @@ class Buffer:
                 (internode only). `unzip` is fused into dispatch, so each local expert's region of
                 `unzipped_tokens` is filled by atomically grabbed slots and its intra-region order is
                 non-deterministic. Regions are aligned to `unzip_alignment` and the padding rows are garbage.
+                `unzipped_tokens` follows the same type as the input `x`, i.e. a `(tokens, scales)` tuple
+                for FP8.
             atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue: also only appended when `unzip_alignment > 0`, see
                 DESIGN.md. `task_queue` is `[num_chunks, 4]` with `[expert_idx, m_start, m_size, ready]`,
                 pushed in FIFO order by whichever warp happens to complete a chunk last.
@@ -506,7 +508,7 @@ class Buffer:
                 recv_src_meta, send_rdma_head, send_nvl_head = handle
             num_recv_tokens = recv_src_meta.size(0)
             num_rdma_recv_tokens = send_nvl_head.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
+            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
                 rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
@@ -519,7 +521,7 @@ class Buffer:
                 recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
                 recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
                 recv_src_meta, send_rdma_head, send_nvl_head, \
-                unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue, event = self.runtime.internode_dispatch(
+                unzipped_tokens, unzipped_scales, unzipped_probs, atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue, event = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights,
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
@@ -531,7 +533,8 @@ class Buffer:
             ret = ((recv_x, recv_x_scales) if x_scales is not None else recv_x, recv_topk_idx, recv_topk_weights,
                    num_recv_tokens_per_expert_list, handle, EventOverlap(event))
             if unzip_alignment > 0:
-                return ret + (unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue)
+                unzipped_x = (unzipped_tokens, unzipped_scales) if x_scales is not None else unzipped_tokens
+                return ret + (unzipped_x, unzipped_probs, atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue)
             return ret
 
     # noinspection PyTypeChecker

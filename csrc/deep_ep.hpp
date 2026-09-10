@@ -235,6 +235,7 @@ public:
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
                std::optional<EventHandle>>
     internode_dispatch(const torch::Tensor& x,
                        const std::optional<torch::Tensor>& x_scales,

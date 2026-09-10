@@ -480,6 +480,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
              int rank,
              int num_ranks,
              int4* unzipped_x,
+             float* unzipped_scales,
              float* unzipped_probs,
              int* unzipped_expert_counter,
              const int* unzip_expert_meta,
@@ -1154,6 +1155,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
                 bool scale_aligned = (scale_bytes % 16 == 0);
                 auto tma_load_bytes = hidden_bytes + (scale_aligned ? scale_bytes : 0);
+                auto nvl_scales = reinterpret_cast<const float*>(shifted + hidden_bytes);
 
                 // Copy data
                 if (elect_one_sync()) {
@@ -1228,6 +1230,23 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                         auto unzipped_idx = static_cast<int64_t>(expert_base) + slot;
 
                         tma_store_1d(tma_buffer, unzipped_x + unzipped_idx * hidden_int4, hidden_bytes, false);
+
+                        // FP8: the scales travel with the token, so multicast them the same way
+                        // NOTES: the aligned case reuses the scales already loaded into smem next to the
+                        // token; otherwise this lane copies them from the NVL buffer, which is still
+                        // valid because the channel head is only moved after the whole chunk is done
+                        if (unzipped_scales != nullptr) {
+                            if (scale_aligned) {
+                                tma_store_1d(tma_buffer + hidden_bytes,
+                                             unzipped_scales + unzipped_idx * num_scales,
+                                             scale_bytes,
+                                             false);
+                            } else {
+                                for (int i = 0; i < num_scales; ++i)
+                                    st_na_global(unzipped_scales + unzipped_idx * num_scales + i, ld_nc_global(nvl_scales + i));
+                            }
+                        }
+
                         st_na_global(unzipped_probs + unzipped_idx, local_expert_prob);
                         st_na_global(atomic_to_zip + unzipped_idx, static_cast<int>(recv_token_idx));
                         st_na_global(zip_to_atomic + recv_token_idx * num_topk + lane_id, static_cast<int>(unzipped_idx));
@@ -1337,6 +1356,7 @@ void dispatch(void* recv_x,
               int num_channels,
               bool low_latency_mode,
               void* unzipped_x,
+              float* unzipped_scales,
               float* unzipped_probs,
               int* unzipped_expert_counter,
               const int* unzip_expert_meta,
@@ -1399,6 +1419,7 @@ void dispatch(void* recv_x,
                       rank,                                                                                                    \
                       num_ranks,                                                                                               \
                       reinterpret_cast<int4*>(unzipped_x),                                                                     \
+                      unzipped_scales,                                                                                         \
                       unzipped_probs,                                                                                          \
                       unzipped_expert_counter,                                                                                 \
                       unzip_expert_meta,                                                                                       \

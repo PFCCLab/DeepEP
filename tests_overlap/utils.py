@@ -166,3 +166,56 @@ def grouped_launch(funcs, begin, end, calc_stream, comm_stream, event=None):
 
     if i % 2 != 0:
         paddle.base.core._set_current_stream(stream_bases[0])
+
+
+def quant_input(x, use_ue8m0=False):
+    """对于 hidden_states, 在 hidden 维上使用 128 分块量化."""
+    x_fp8, scale = paddle.incubate.nn.functional.fp8_quant_blockwise(
+        x,
+        quant_method="1x128",
+        output_scale_transpose=False,
+        using_ue8m0_scale=use_ue8m0,
+    )
+    assert x_fp8.shape == x.shape
+    assert scale.shape == [x.shape[0], x.shape[1] // (512 if use_ue8m0 else 128)]
+    assert x_fp8.is_contiguous()
+    assert scale.is_contiguous()
+    return x_fp8, scale
+
+
+def quant_weight(w, transpose=False, use_ue8m0=False):
+    import paddlefleet_ops
+    # quant 算子只接受 list 输入，这里手动切成列表
+    expert_weight_list = list(w)
+    if transpose:
+        w_fp8, scale = paddlefleet_ops.fuse_stack_transpose_fp8_quant(
+            expert_weight_list,
+            using_pow2_scaling=False,
+            using_ue8m0_scale=use_ue8m0,
+            output_scale_transpose=False,
+        )
+        assert w_fp8.shape == [w.shape[0] * w.shape[2], w.shape[1]]
+        assert scale.shape == [w.shape[0] * w.shape[2], w.shape[1] // (512 if use_ue8m0 else 128)]
+        assert w_fp8.is_contiguous()
+        assert scale.is_contiguous()
+    else:
+        assert 0
+        w_fp8, scale = paddlefleet_ops.fuse_stack_fp8_quant(
+            expert_weight_list,
+            using_pow2_scaling=False,
+            using_ue8m0_scale=use_ue8m0,
+            output_scale_transpose=False,
+        )
+    # quant 算子输出把专家维铺平了，需要重新展开
+    w_fp8 = w_fp8.reshape([w.shape[0], -1, w_fp8.shape[1]])
+    scale = scale.reshape([w.shape[0], -1, scale.shape[1]])
+    # ue8m0 要求 scale 底层 transpose 但表面 shape 不变
+    if use_ue8m0:
+        scale = scale.transpose([0, 2, 1]).contiguous().transpose([0, 2, 1])
+    return w_fp8, scale
+
+
+def dequant(x, scale, use_ue8m0=False):
+    if use_ue8m0:
+        scale = 2.0 ** (scale.contiguous().view("int8").cast("int32") - 127)
+    return x.float() * scale.repeat_interleave(128, axis=-1)

@@ -111,6 +111,19 @@ TMA 的可见性问题：原来的 `tma_store_wait` 用的是 `cp.async.bulk.wai
 性能：`kNumThreads=512` 实测最优。目前 zip 不是瓶颈，但按相同 SM 数折算，带宽利用率只有 paddle 原版的一半左右，说明每 token 的两道 sync + 一次暴露的 acquire 延迟没被掩盖（只有 1 个 block/SM，没有别的 block 能换进来）。
 
 
+### FP8 dispatch
+
+融合 unzip 现在跟着 `x` 的类型走：`dispatch((x_fp8, x_scale), unzip_alignment=...)` 时返回的 `unzipped_x` 也是 `(unzipped_tokens, unzipped_scale)` 元组，bf16 下仍然是单个 tensor，接口向后兼容。
+
+kernel 侧改动只有多播那一段：receiver 的 TMA load 本来就把 `hidden + scale` 一起搬进 smem（`scale_bytes % 16 == 0` 时），所以每个命中的 lane 在发 token 的 TMA store 之后再发一次 scale 的 TMA store 就行，两次 store 由同一个 lane 的 `tma_store_wait_complete` 一起等，chunk 入队的 release 语义不用动。scale_bytes 不对齐时退化成该 lane 自己从 NVL buffer 逐个 int 拷贝（此时通道 head 还没推进，源数据仍有效）。
+
+`unzipped_scale` 的 layout 和 `recv_x_scales` 一致，是**非 transpose** 的连续 `[num_unzipped_tokens, num_scales]`（DeepEP 不支持发 transpose 的 scale），需要 transpose 的话由计算侧自己 `.T.contiguous().T`，和 baseline 里 `moe_permute` 之后那一步一样。
+
+单测 `tests_overlap/test_internode_forward_fp8.py`：dispatch 的输出和 baseline（原版 dispatch + `moe_permute`）逐字节比对，`recv_x` 直接比，`unzipped_x` 按 `atomic_to_zip` 排回 DeepEP 序再比。注意 `moe_permute` 输出的 scale 底层是 transpose 的，必须先整体 `contiguous()` 再切片，否则切片出来的东西不能直接 `view`。fp8 也没有 `gather` kernel，重排前要先转成 uint8 视图。
+
+正确性：16 个 rank 上 token 和 scale 的 diff 全为 0。
+
+
 ## 后续优化思路（暂不做，等 overlap 跑通）
 
 1. **融合模式下考虑不写 `recv_x`**。当前 receiver 的写入量是原版的 2.23 倍（recv_x 1.0 + 多播 1.23）。每个收到的 token 至少命中一个本地专家，内容已完整存在于 `unzipped_x`，而计算读 `unzipped_tokens`、zip 写 `combine_input`、combine 读 `combine_input` 和 handle 里的 `recv_src_meta`，都不碰 `recv_x`。如果确认没有消费者（需要先查反向 cached dispatch 是否依赖），写入量可降到 1.23 倍，约省 0.35 ms，融合后的 dispatch 有可能比原版纯 dispatch 还快。
