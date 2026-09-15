@@ -4,8 +4,6 @@ import torch.distributed as dist
 from typing import Any, Optional, Tuple
 
 # noinspection PyUnresolvedReferences
-import deep_ep_cpp
-# noinspection PyUnresolvedReferences
 from deep_ep_cpp import EventHandle
 
 import paddle
@@ -115,27 +113,3 @@ def get_event_from_comm_stream(group_id: int) -> EventOverlap:
     return EventOverlap(
         event=paddle.base.core.get_event_handle_from_comm_stream(group_id)
     )
-
-
-def zip(o3: torch.Tensor, zip_to_atomic: torch.Tensor, recv_topk_idx: torch.Tensor,
-        zip_task_queue: torch.Tensor, zip_done: torch.Tensor, num_ctas: int = 4) -> torch.Tensor:
-    """
-    Accumulate each token's expert outputs back into the DeepEP order, producing combine's input.
-
-    This is a persistent kernel launched on the current (compute) stream, so it is meant to be called
-    right after `dispatch(async_finish=True)` and to run while dispatch and the experts are still going.
-    Each CTA owns a whole token and picks up the queue entries where `task_idx % num_ctas == cta_id`,
-    and a token's slots are summed in ascending local-expert order so the result is reproducible.
-
-    Arguments:
-        o3: `[num_unzipped_tokens, hidden]` bf16, the experts' outputs in atomic order.
-        zip_to_atomic: `[num_recv_tokens, topk]` int32 from dispatch, -1 for the invalid slots.
-        recv_topk_idx: `[num_recv_tokens, topk]` from dispatch, the local expert indices.
-        zip_task_queue: `[num_recv_tokens]` int32 filled by the compute side, initialized to -1.
-        zip_done: `[num_recv_tokens]` int32, zeroed by the caller, set to 1 once a token is zipped.
-        num_ctas: how many SMs to use.
-
-    Returns:
-        combine_input: `[num_recv_tokens, hidden]` bf16, in DeepEP order.
-    """
-    return deep_ep_cpp.zip(o3, zip_to_atomic, recv_topk_idx, zip_task_queue, zip_done, num_ctas)

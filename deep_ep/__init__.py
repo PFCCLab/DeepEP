@@ -1,6 +1,6 @@
 import torch
 
-from .utils import EventOverlap, get_event_from_comm_stream, zip
+from .utils import EventOverlap, get_event_from_comm_stream
 from .buffer import Buffer
 
 # noinspection PyUnresolvedReferences

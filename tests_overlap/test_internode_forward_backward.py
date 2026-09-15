@@ -34,7 +34,6 @@ ALIGNMENT = 128
 CHUNK = 4096
 COMBINE_OVERLAP_RATIO = 0.3
 
-FUSED_SWIGLU = False
 PRECISE_SWIGLU = True
 INTERLEAVED = False
 OVERLAP_WGRAD = True
@@ -146,8 +145,6 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
     zipped_out = paddle.empty_like(recv_x)
 
     token_done = paddle.zeros([num_recv_tokens], "int32")
-    zip_task_queue = paddle.full([num_recv_tokens], -1, "int32")
-    zip_queue_tail = paddle.zeros([1], "int32")
     zip_done = paddle.zeros([num_recv_tokens], "int32")
 
     calc_stream = paddle.cuda.current_stream()
@@ -155,11 +152,10 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
 
     funcs = [
         lambda task_idx: deep_gemm.bf16_chunk_gemm_nn(
-            unzipped_tokens, w_gateup, o1, task_queue, task_idx,
-            **(dict(o2=o2, probs=unzipped_probs) if FUSED_SWIGLU else {})),
+            unzipped_tokens, w_gateup, o1, task_queue, task_idx),
         lambda task_idx: deep_gemm.chunk_weighted_swiglu(
-            o1, unzipped_probs, o2, task_queue, task_idx, precise=PRECISE_SWIGLU,
-            interleaved=INTERLEAVED) if not FUSED_SWIGLU else (),
+            o1, unzipped_probs, o2, task_queue, task_idx, CHUNK, precise=PRECISE_SWIGLU,
+            interleaved=INTERLEAVED),
         lambda task_idx: deep_gemm.bf16_chunk_gemm_nn(o2, w_down, o3, task_queue, task_idx),
         lambda task_idx: deep_gemm.chunk_zip(
             o3, zipped_out, atomic_to_zip, zip_to_atomic, recv_token_indices, num_valid_topk,
@@ -320,14 +316,13 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
         async_load = AsyncLoad()
         m_start = async_load(m_start, dtype="int32")
 
-        # x 从 recv_x 中解压, 这里使用 gather 并非最优性能, 因为重复读了 recv_x 的某些行
-        ordered_to_zip = deep_gemm.sort_unzip_map(
+        ordered_to_zip, ordered_to_atomic = deep_gemm.sort_map(
             zip_to_atomic_bwd, m_start, num_unzipped_tokens)
+
+        # x 从 recv_x 中解压, 这里使用 gather 并非最优性能, 因为重复读了 recv_x 的某些行
         x_wgrad = deep_gemm.token_gather(recv_x, ordered_to_zip)
 
         # do1/o2_bwd/do3 从反向 atomic 序的输入重排序为标准 unzip 序
-        ordered_to_atomic = deep_gemm.sort_atomic_map(
-            zip_to_atomic_bwd, m_start, num_unzipped_tokens)
         do1_wgrad = deep_gemm.token_gather(do1, ordered_to_atomic)
         o2_bwd = deep_gemm.token_gather(o2_bwd, ordered_to_atomic)
         do3 = deep_gemm.token_gather(do3, ordered_to_atomic)

@@ -330,13 +330,4 @@ inline void SetAllocatorStreamForGPUContext(gpuStream_t stream,
                         .get());
 }
 
-// Standalone zip: launched by the user on the compute stream, in parallel with a running dispatch.
-// NOTES: it needs no buffer state, hence a free function rather than a `Buffer` method
-torch::Tensor zip_tokens(const torch::Tensor& o3,
-                         const torch::Tensor& zip_to_atomic,
-                         const torch::Tensor& recv_topk_idx,
-                         const torch::Tensor& zip_task_queue,
-                         const torch::Tensor& zip_done,
-                         int num_ctas);
-
 }  // namespace deep_ep

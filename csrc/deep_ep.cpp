@@ -1990,44 +1990,6 @@ void Buffer::low_latency_clean_mask_buffer() {
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
 }
 
-torch::Tensor zip_tokens(const torch::Tensor& o3,
-                         const torch::Tensor& zip_to_atomic,
-                         const torch::Tensor& recv_topk_idx,
-                         const torch::Tensor& zip_task_queue,
-                         const torch::Tensor& zip_done,
-                         int num_ctas) {
-    EP_HOST_ASSERT(o3.dim() == 2 and o3.is_contiguous() and o3.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(zip_to_atomic.dim() == 2 and zip_to_atomic.is_contiguous() and zip_to_atomic.scalar_type() == torch::kInt32);
-    EP_HOST_ASSERT(recv_topk_idx.dim() == 2 and recv_topk_idx.is_contiguous());
-    EP_HOST_ASSERT(recv_topk_idx.sizes() == zip_to_atomic.sizes());
-    EP_HOST_ASSERT(zip_task_queue.dim() == 1 and zip_task_queue.is_contiguous() and zip_task_queue.scalar_type() == torch::kInt32);
-    EP_HOST_ASSERT(zip_done.dim() == 1 and zip_done.is_contiguous() and zip_done.scalar_type() == torch::kInt32);
-
-    auto num_recv_tokens = static_cast<int>(zip_to_atomic.size(0));
-    auto num_topk = static_cast<int>(zip_to_atomic.size(1));
-    auto hidden = static_cast<int>(o3.size(1));
-    EP_HOST_ASSERT(zip_task_queue.size(0) == num_recv_tokens and zip_done.size(0) == num_recv_tokens);
-    EP_HOST_ASSERT(hidden % (sizeof(int4) / sizeof(nv_bfloat16)) == 0);
-    EP_HOST_ASSERT(num_ctas > 0);
-
-    // NOTES: `recv_topk_idx` comes straight out of dispatch, so it keeps `topk_idx_t`'s width
-    EP_HOST_ASSERT(recv_topk_idx.element_size() == sizeof(topk_idx_t));
-
-    auto combine_input = torch::empty({num_recv_tokens, hidden}, o3.options());
-    zip::zip(reinterpret_cast<int4*>(combine_input.data_ptr()),
-             reinterpret_cast<const int4*>(o3.data_ptr()),
-             zip_to_atomic.data_ptr<int>(),
-             reinterpret_cast<const topk_idx_t*>(recv_topk_idx.data_ptr()),
-             zip_task_queue.data_ptr<int>(),
-             zip_done.data_ptr<int>(),
-             num_recv_tokens,
-             num_topk,
-             hidden / (sizeof(int4) / sizeof(nv_bfloat16)),
-             num_ctas,
-             at::cuda::getCurrentCUDAStream());
-    return combine_input;
-}
-
 }  // namespace deep_ep
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -2083,7 +2045,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
 
     m.def("is_sm90_compiled", deep_ep::is_sm90_compiled);
-    m.def("zip", &deep_ep::zip_tokens);
     m.attr("topk_idx_t") =
         py::reinterpret_borrow<py::object>((PyObject*)torch::getTHPDtype(c10::CppTypeToScalarType<deep_ep::topk_idx_t>::value));
 }

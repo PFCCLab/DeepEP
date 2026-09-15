@@ -33,11 +33,10 @@
 
 3. 计算部分，使用 DeepGEMM 的 bf16 矩阵乘，在另一个流上并发进行：
   * 计算 kernel 每次从任务队列拿出一个任务，进行计算
-  * 每组算子完成任务后，往一个表记录每个 token 的完成情况（已经被几个专家完成）
-  * 计算部分正在由另一组同事开发中，目前虽然不能运行，但是已经约定好双方的数据交换格式与信号逻辑，见后
+  * 每组算子完成任务后，首先往一个表记录每个 token 的完成情况（已经被几个专家完成），对于已经本机上的 topk 个所属专家完成的 token 即可进行 zip
+  * zip 算子需要同时负责如下工作：更新 token 完成情况、求和输出到 combine 的输入 buffer、更新 combine 输入就绪信号
 
-4. zip 与 combine 部分，zip 是一个单独的 persistent kernel，combine 也使用 DeepEP，增加信号等待逻辑：
-  * zip 通过读计算完成队列，对于一个不重复 token，当它 topk 的所有专家都计算完就对其进行求和操作，写到 combine 的输入 buffer
+4. combine 部分，也使用 DeepEP，增加信号等待逻辑：
   * combine 和 dispatch 同一个流，所以一定在 dispatch 完成后才启动
   * comine 同样增加一个等待逻辑，等输入 buffer 里的一个 token 就绪之后才发出
 
@@ -52,11 +51,9 @@
 
 dispatch+unzip：我已经看过 DeepEP 的代码，也看过其他一些竞品的实现，基本就是在 receiver 这个角色上增加一个多播，就是 receiver 本来就要把收到的 token 写到一个不重复的 recv_tokens buffer 里，我们只要在这里再加一些写逻辑，把 token 顺便写到各专家的 buffer，改动应该很小；当然，这样改可能会对性能有影响，但也不确定，需要先改了才知道，但根据竞品的测试，影响不大，因为 dispatch 瓶颈在跨机带宽
 
-zip：需要新实现一个 persistent 风格的 kernel，读计算完成的信号，然后进行累加，再更新 combine 的输入信号
-
 combine：同样改动很小，就是直接在原有 combine 的 sender 上增加一个等待逻辑，本来 sender 是把输入的 token 无条件地搬运到 nvl buffer 上，现在要加一个等待，必须等 token 就绪才搬；这个等待是按顺序等待，不能跳过 token，这样可能会施加比较强的阻塞条件，但可能还好，我们之前有同事做过模拟实验，combine 和计算的 overlap 率能达到 50%，再怎么阻塞也比完全不 overlap 赚了
 
-我和计算那边也对 SM 资源进行了协商，约定 dispatch/combine 使用 48 SM，zip 使用 4 SM，其他的是计算的 persistent kernel。另外，所有 kernel 统一使用 2-CTA，避免 launch 时出现不同 CTA 冲突的情况。
+我和计算那边也对 SM 资源进行了协商，约定 dispatch/combine 使用 48 SM，计算的 persistent kernel 使用 100 SM。另外，所有 kernel 统一使用 2-CTA，避免 launch 时出现不同 CTA 冲突的情况。
 
 
 ### buffer设计
@@ -114,11 +111,6 @@ dispatch 需要给到计算的除了 unzipped_tokens 和 unzipped_probs，还有
 
 为了让计算侧知道每个 token 的有效 topk 数，dispatch 还会给一张计数表，同样是随 ready 动态更新的：
 `num_valid_topk`[num_recv_tokens] int32 : 使用 DeepEP 序，记录每个 token 在本地有几个专家，其值等价于**通信完成后** recv_token_indices 里面每行非 -1 的和，但是在运行时不相等，因为 recv_token_indices 的一行是分专家更新的，一个 chunk 就绪时只保证这个 chunk 所属专家在 recv_token_indices 里面的槽位就绪，不保证这一行所有专家都就绪，导致数少了；num_valid_topk 则是通过冗余更新解决这个问题，一个 token 的每个专家的 chunk 发布时都会重新写一次 topk 值；保险起见，num_valid_topk 初始化为 0，如果计算侧读到 0 则认为出错
-
-计算那边给到我们的则是一个 token 完成队列，记录可以进行 zip 的 token 下标：
-`zip_task_queue`[num_recv_tokens] int32 : 和 task_queue 类似使用 atomic 竞争入队，内容为计算完的 token 在 DeepEP 序中的下标；计算侧会计数每个 token 被多少个专家完成了，当完成的次数等于 num_valid_topk 里的值时，该 token 就会被 push 进来；该队列初始化为全 -1，这样当读到非 -1 时就知道就绪了，不需要额外 ready 信号；zip 从头开始连续扫描，遇到 -1 则等待，不可跳过
-
-说明：计算侧使用了非常暴力的同步保证，计算侧对每个 chunk 都 launch 了一个独立的 gemm kernel，gemm 完成后也不由自己更新 zip_task_queue，而是又启动一个 kernel 来更新计数器和入队 zip_task_queue，因此 zip 读到任务时 token 一定已经写入 o3
 
 zip 和 combine 之间还有一个信号，记录每个 token 是否可以被 combine：
 `zip_done`[num_recv_tokens] int32 : 使用 DeepEP 序，仅使用 0/1 值表示即可；combine 时每个 channel 的 sender 仍然按原来的顺序进行发送，但是当一个 token 未就绪时需要等待，不可跳过

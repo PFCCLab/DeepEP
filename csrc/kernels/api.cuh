@@ -46,23 +46,6 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
 
 }  // namespace layout
 
-// Fused zip kernel, i.e. accumulating each token's expert outputs back into the DeepEP order
-namespace zip {
-
-void zip(int4* combine_input,
-         const int4* o3,
-         const int* zip_to_atomic,
-         const topk_idx_t* recv_topk_idx,
-         const int* zip_task_queue,
-         int* zip_done,
-         int num_recv_tokens,
-         int num_topk,
-         int hidden_int4,
-         int num_ctas,
-         cudaStream_t stream);
-
-}  // namespace zip
-
 // Intranode kernels
 namespace intranode {
 
