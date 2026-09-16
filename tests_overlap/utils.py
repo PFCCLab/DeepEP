@@ -170,18 +170,24 @@ def grouped_launch(funcs, begin, end, calc_stream, comm_stream, event=None):
             paddle.base.core._set_current_stream(stream_bases[0])
 
 
+relay_stream = paddle.cuda.Stream()  # 仅用于将 deep_ep event 转换为 paddle event
+other_stream = paddle.cuda.Stream()  # 用于 grouped launch 两个流同时发起计算
+
+
 class GroupedTaskLauncher:
-    def __init__(self, funcs, num_tasks, calc_stream, comm_stream, comm_event,
-                 combine_overlap_ratio=0.3):
+    def __init__(self, funcs, num_tasks, dispatch_event, combine_overlap_ratio=0.3):
         self._funcs = funcs
         self._num_tasks = num_tasks
-        self._calc_stream = calc_stream
-        self._comm_stream = comm_stream
-        self._comm_event = comm_event
         self._combine_overlap_ratio = combine_overlap_ratio
-
-        self._prev_task_event = paddle.cuda.Event()
         self._next_task_idx = 0
+        self._calc_stream = paddle.cuda.current_stream()
+        self._comm_stream = other_stream
+        self._dispatch_event = paddle.cuda.Event()
+        self._prev_task_event = paddle.cuda.Event()
+
+        with paddle.device.stream_guard(relay_stream):
+            dispatch_event.current_stream_wait()
+            self._dispatch_event.record()
 
     def run_dispatch_overlap(self):
         """阶段A: dispatch 与计算 overlap, 计算只使用部分 SM"""
@@ -198,8 +204,56 @@ class GroupedTaskLauncher:
             self._next_task_idx = task_idx + 1
 
             # 当 dispatch 恰好完成时, 切换至纯计算模式
-            if self._comm_event.query():
+            if self._dispatch_event.query():
                 break
+
+        return self._next_task_idx
+
+    def run_dispatch_overlap_dual_stream(self):
+        """双流版本的阶段A"""
+        assert len(self._funcs) == 4, "dual stream is for 4-stage task"
+        gemm0, act, gemm1, zip = self._funcs
+        streams = [self._calc_stream, self._comm_stream]
+        stream_bases = [self._calc_stream.stream_base, self._comm_stream.stream_base]
+        event = paddle.cuda.Event()
+
+        for task_idx in range(self._num_tasks):
+            paddle.base.core.nvprof_nvtx_push(f"A{task_idx}")
+            i = task_idx % 2
+            paddle.base.core._set_current_stream(stream_bases[i])
+
+            gemm0(task_idx)
+
+            # 上一个 task 的 zip
+            if task_idx > 0:
+                paddle.base.core._set_current_stream(stream_bases[1 - i])
+                zip(task_idx - 1)
+                paddle.base.core._set_current_stream(stream_bases[i])
+
+            act(task_idx)
+
+            self._prev_task_event.record()
+
+            # 另一个流的 gemm0 不得早于当前流的 act
+            event.record()
+            streams[1 - i].wait_event(event)
+
+            gemm1(task_idx)
+
+            paddle.base.core.nvprof_nvtx_pop()
+
+            # 等当前 task 的 act 完成才开始发射下一个 task
+            self._prev_task_event.synchronize()
+            self._next_task_idx = task_idx + 1
+
+            # 当 dispatch 恰好完成时, 切换至纯计算模式
+            if self._dispatch_event.query():
+                break
+
+        # 结束 dispatch overlap 阶段时, 在最后一个 task 所在的 stream 发射其 zip
+        if self._num_tasks > 0:
+            zip(task_idx)
+            paddle.base.core._set_current_stream(stream_bases[0])
 
         return self._next_task_idx
 
@@ -210,8 +264,8 @@ class GroupedTaskLauncher:
 
         if begin < end:
             paddle.base.core.nvprof_nvtx_push(f"B{begin}_{end - 1}")
-            grouped_launch(
-                self._funcs, begin, end, self._calc_stream, self._comm_stream, self._comm_event)
+            grouped_launch(self._funcs, begin, end, self._calc_stream, self._comm_stream,
+                           self._dispatch_event)
             paddle.base.core.nvprof_nvtx_pop()
 
         self._next_task_idx = end

@@ -35,12 +35,6 @@ ALIGNMENT = 128
 USE_UE8M0 = True  # 当前只支持 ue8m0
 QUANT_BLOCK_SIZE = 512
 
-# DeepEP doesn't expose its comm stream, use this as a parallel stream to
-# launch compute kernels and proxy DeepEP events
-comm_stream = paddle.cuda.Stream()
-comm_event = paddle.cuda.Event()
-calc_stream = paddle.cuda.current_stream()
-
 
 def prepare_case_inputs(group):
     # E 是本地专家数, num_experts 是全局专家数
@@ -360,10 +354,6 @@ def run_overlap(group, buffer, hidden_states, dout, token_probs, token_indices,
     num_tasks = len(task_queue)
     num_recv_tokens = len(recv_x[0])
 
-    with paddle.device.stream_guard(comm_stream):
-        event.current_stream_wait()
-        comm_event.record()
-
     if logging:
         print("tokens_per_expert:", tokens_per_expert)
         print("num_tasks:", [(n + CHUNK - 1) // CHUNK for n in tokens_per_expert], "=", num_tasks)
@@ -393,8 +383,7 @@ def run_overlap(group, buffer, hidden_states, dout, token_probs, token_indices,
             token_done, zip_done, task_queue, task_idx, CHUNK),
     ]
 
-    task_launcher = GroupedTaskLauncher(
-        funcs, num_tasks, calc_stream, comm_stream, comm_event, COMBINE_OVERLAP_RATIO)
+    task_launcher = GroupedTaskLauncher(funcs, num_tasks, event, COMBINE_OVERLAP_RATIO)
 
     n = task_launcher.run_dispatch_overlap()
     print("[FW] dispatch->compute:", n) if logging else ()
@@ -445,10 +434,6 @@ def run_overlap(group, buffer, hidden_states, dout, token_probs, token_indices,
     do3_fp8, do3_scale = do3
     do3 = (do3_fp8, do3_scale.T)
 
-    with paddle.device.stream_guard(comm_stream):
-        event.current_stream_wait()
-        comm_event.record()
-
     ############################## GEMM BACKWARD ###############################
 
     do2 = paddle.empty([num_unzipped_tokens, I], dtype="bfloat16")
@@ -477,8 +462,7 @@ def run_overlap(group, buffer, hidden_states, dout, token_probs, token_indices,
             num_valid_topk, token_done, zip_done, task_queue_bwd, task_idx, CHUNK),
     ]
 
-    task_launcher = GroupedTaskLauncher(
-        funcs, num_tasks, calc_stream, comm_stream, comm_event, COMBINE_OVERLAP_RATIO)
+    task_launcher = GroupedTaskLauncher(funcs, num_tasks, event, COMBINE_OVERLAP_RATIO)
 
     n = task_launcher.run_dispatch_overlap()
     print("[BW] dispatch->compute:", n) if logging else ()
