@@ -1251,6 +1251,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     auto task_queue = std::optional<torch::Tensor>();
     auto task_queue_counter = std::optional<torch::Tensor>();
     int num_chunks = 0;
+    int num_unzipped_tokens = 0;
     if (unzip_alignment > 0) {
         EP_HOST_ASSERT(not cached_mode and num_worst_tokens == 0);
         EP_HOST_ASSERT(topk_idx.has_value());
@@ -1258,7 +1259,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         EP_HOST_ASSERT(unzip_chunk_size > 0);
 
         // Per-expert metadata: {base offset in `unzipped_x`, real token count, chunk base index}
-        int num_unzipped_tokens = 0;
         for (int i = 0; i < num_local_experts; ++i) {
             auto n = num_recv_tokens_per_expert_list[i];
             unzip_expert_meta_host[i * 3 + 0] = num_unzipped_tokens;
@@ -1274,7 +1274,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 
         if (x_scales.has_value()) {
             unzipped_scales = x_scales->dim() == 1 ? torch::empty({num_unzipped_tokens}, x_scales->options())
-                                                   : torch::empty({num_unzipped_tokens, num_scales}, x_scales->options());
+                                                   : torch::empty({num_scales, num_unzipped_tokens}, x_scales->options());
         }
 
         // Both mapping tables are only assigned for the slots that are actually claimed, so the
@@ -1358,7 +1358,8 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         unzip_chunk_done.has_value() ? unzip_chunk_done->data_ptr<int>() : nullptr,
                         task_queue.has_value() ? task_queue->data_ptr<int>() : nullptr,
                         task_queue_counter.has_value() ? task_queue_counter->data_ptr<int>() : nullptr,
-                        unzip_chunk_size);
+                        unzip_chunk_size,
+                        num_unzipped_tokens);
 
     // Wait streams
     std::optional<EventHandle> event;

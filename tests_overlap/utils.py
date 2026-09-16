@@ -160,62 +160,72 @@ def grouped_launch(funcs, begin, end, calc_stream, comm_stream, event=None):
         paddle.base.core.nvprof_nvtx_push(f"G{n}")
         for i, task_idx in enumerate(range(begin, end)):
             # 直接调用 core 比用 stream_guard 开销更低, 这里的发射速度非常关键
-            paddle.base.core._set_current_stream(stream_bases[i % 2])
+            if i != 0:
+                paddle.base.core._set_current_stream(stream_bases[i % 2])
             func(task_idx)
         paddle.base.core.nvprof_nvtx_pop()
 
-    if i % 2 != 0:
-        paddle.base.core._set_current_stream(stream_bases[0])
+        # 每组 func 调用结束时恢复到默认计算流
+        if i % 2 != 0:
+            paddle.base.core._set_current_stream(stream_bases[0])
 
 
-def quant_input(x, use_ue8m0=False):
-    """对于 hidden_states, 在 hidden 维上使用 128 分块量化."""
-    x_fp8, scale = paddle.incubate.nn.functional.fp8_quant_blockwise(
-        x,
-        quant_method="1x128",
-        output_scale_transpose=False,
-        using_ue8m0_scale=use_ue8m0,
-    )
-    assert x_fp8.shape == x.shape
-    assert scale.shape == [x.shape[0], x.shape[1] // (512 if use_ue8m0 else 128)]
-    assert x_fp8.is_contiguous()
-    assert scale.is_contiguous()
-    return x_fp8, scale
+class GroupedTaskLauncher:
+    def __init__(self, funcs, num_tasks, calc_stream, comm_stream, comm_event,
+                 combine_overlap_ratio=0.3):
+        self._funcs = funcs
+        self._num_tasks = num_tasks
+        self._calc_stream = calc_stream
+        self._comm_stream = comm_stream
+        self._comm_event = comm_event
+        self._combine_overlap_ratio = combine_overlap_ratio
 
+        self._prev_task_event = paddle.cuda.Event()
+        self._next_task_idx = 0
 
-def quant_weight(w, transpose=False, use_ue8m0=False):
-    import paddlefleet_ops
-    # quant 算子只接受 list 输入，这里手动切成列表
-    expert_weight_list = list(w)
-    if transpose:
-        w_fp8, scale = paddlefleet_ops.fuse_stack_transpose_fp8_quant(
-            expert_weight_list,
-            using_pow2_scaling=False,
-            using_ue8m0_scale=use_ue8m0,
-            output_scale_transpose=False,
-        )
-        assert w_fp8.shape == [w.shape[0] * w.shape[2], w.shape[1]]
-        assert scale.shape == [w.shape[0] * w.shape[2], w.shape[1] // (512 if use_ue8m0 else 128)]
-        assert w_fp8.is_contiguous()
-        assert scale.is_contiguous()
-    else:
-        assert 0
-        w_fp8, scale = paddlefleet_ops.fuse_stack_fp8_quant(
-            expert_weight_list,
-            using_pow2_scaling=False,
-            using_ue8m0_scale=use_ue8m0,
-            output_scale_transpose=False,
-        )
-    # quant 算子输出把专家维铺平了，需要重新展开
-    w_fp8 = w_fp8.reshape([w.shape[0], -1, w_fp8.shape[1]])
-    scale = scale.reshape([w.shape[0], -1, scale.shape[1]])
-    # ue8m0 要求 scale 底层 transpose 但表面 shape 不变
-    if use_ue8m0:
-        scale = scale.transpose([0, 2, 1]).contiguous().transpose([0, 2, 1])
-    return w_fp8, scale
+    def run_dispatch_overlap(self):
+        """阶段A: dispatch 与计算 overlap, 计算只使用部分 SM"""
+        for task_idx in range(self._num_tasks):
+            paddle.base.core.nvprof_nvtx_push(f"A{task_idx}")
+            for func in self._funcs:
+                func(task_idx)
+            paddle.base.core.nvprof_nvtx_pop()
 
+            # 只提前发射一个 task, 从而及时根据 dispatch 完成状态切换 SM 数
+            if task_idx > 0:
+                self._prev_task_event.synchronize()
+            self._prev_task_event.record()
+            self._next_task_idx = task_idx + 1
 
-def dequant(x, scale, use_ue8m0=False):
-    if use_ue8m0:
-        scale = 2.0 ** (scale.contiguous().view("int8").cast("int32") - 127)
-    return x.float() * scale.repeat_interleave(128, axis=-1)
+            # 当 dispatch 恰好完成时, 切换至纯计算模式
+            if self._comm_event.query():
+                break
+
+        return self._next_task_idx
+
+    def run_compute(self):
+        """阶段B: 纯计算, 计算使用全部 SM"""
+        begin = self._next_task_idx
+        end = max(int(self._num_tasks * (1 - self._combine_overlap_ratio)), begin)  # excluded
+
+        if begin < end:
+            paddle.base.core.nvprof_nvtx_push(f"B{begin}_{end - 1}")
+            grouped_launch(
+                self._funcs, begin, end, self._calc_stream, self._comm_stream, self._comm_event)
+            paddle.base.core.nvprof_nvtx_pop()
+
+        self._next_task_idx = end
+        return end
+
+    def run_combine_overlap(self):
+        """阶段C: combine 与计算 overlap, 计算只使用部分 SM"""
+        for task_idx in range(self._next_task_idx, self._num_tasks):
+            paddle.base.core.nvprof_nvtx_push(f"C{task_idx}")
+            for func in self._funcs:
+                func(task_idx)
+            paddle.base.core.nvprof_nvtx_pop()
+            self._next_task_idx = task_idx + 1
+
+    def __del__(self):
+        assert self._next_task_idx == self._num_tasks, (
+            f"tasks not correctly launched: next={self._next_task_idx} total={self._num_tasks}")

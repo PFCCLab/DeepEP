@@ -490,7 +490,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
              int* unzip_chunk_done,
              int* task_queue,
              int* task_queue_counter,
-             int unzip_chunk_size) {
+             int unzip_chunk_size,
+             int num_unzipped_tokens) {
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
 
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -1237,13 +1238,13 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                         // valid because the channel head is only moved after the whole chunk is done
                         if (unzipped_scales != nullptr) {
                             if (scale_aligned) {
-                                tma_store_1d(tma_buffer + hidden_bytes,
-                                             unzipped_scales + unzipped_idx * num_scales,
-                                             scale_bytes,
-                                             false);
+                                for (int i = 0; i < num_scales; ++i)
+                                    st_na_global(unzipped_scales + unzipped_idx + i * num_unzipped_tokens,
+                                                 reinterpret_cast<const float*>(tma_buffer + hidden_bytes)[i]);
                             } else {
                                 for (int i = 0; i < num_scales; ++i)
-                                    st_na_global(unzipped_scales + unzipped_idx * num_scales + i, ld_nc_global(nvl_scales + i));
+                                    st_na_global(unzipped_scales + unzipped_idx + i * num_unzipped_tokens,
+                                                 ld_nc_global(nvl_scales + i));
                             }
                         }
 
@@ -1366,7 +1367,8 @@ void dispatch(void* recv_x,
               int* unzip_chunk_done,
               int* task_queue,
               int* task_queue_counter,
-              int unzip_chunk_size) {
+              int unzip_chunk_size,
+              int num_unzipped_tokens) {
     constexpr int kNumDispatchRDMASenderWarps = 7;
     constexpr int kNumTMABytesPerWarp = 16384;
     constexpr int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
@@ -1429,7 +1431,8 @@ void dispatch(void* recv_x,
                       unzip_chunk_done,                                                                                        \
                       task_queue,                                                                                              \
                       task_queue_counter,                                                                                      \
-                      unzip_chunk_size);                                                                                       \
+                      unzip_chunk_size,                                                                                        \
+                      num_unzipped_tokens);                                                                                    \
     }                                                                                                                          \
     break
 
