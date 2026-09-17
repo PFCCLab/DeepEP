@@ -4,7 +4,7 @@ import torch.distributed as dist
 from typing import Any, Optional, Tuple
 
 # noinspection PyUnresolvedReferences
-from deep_ep_cpp import EventHandle
+from teramoe_deep_ep_cpp import EventHandle
 
 import paddle
 

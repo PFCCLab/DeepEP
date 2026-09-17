@@ -4,9 +4,9 @@ import torch.distributed as dist
 from typing import Callable, List, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
-import deep_ep_cpp
+import teramoe_deep_ep_cpp as deep_ep_cpp
 # noinspection PyUnresolvedReferences
-from deep_ep_cpp import Config, EventHandle
+from teramoe_deep_ep_cpp import Config, EventHandle
 from .utils import EventOverlap
 from paddle.distributed.communication.group import Group
 

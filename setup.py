@@ -186,7 +186,7 @@ if __name__ == '__main__':
                      version='1.2.1' + revision,
                      packages=setuptools.find_packages(include=['deep_ep']),
                      ext_modules=[
-                         CUDAExtension(name='deep_ep_cpp',
+                         CUDAExtension(name='teramoe_deep_ep_cpp',
                                        include_dirs=include_dirs,
                                        library_dirs=library_dirs,
                                        sources=sources,
