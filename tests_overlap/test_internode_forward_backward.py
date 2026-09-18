@@ -105,7 +105,7 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
 
     (
         recv_x, recv_token_indices, recv_token_probs,
-        num_recv_tokens_per_expert_list, handle, event,
+        num_recv_tokens_per_expert_list, handle, dispatch_done_event,
         unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic,
         num_valid_topk, task_queue
     ) = buffer.dispatch(
@@ -126,11 +126,6 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
     num_unzipped_tokens = len(unzipped_tokens)
     num_tasks = len(task_queue)
     num_recv_tokens = len(recv_x)
-
-    with paddle.device.stream_guard(comm_stream):
-        event.current_stream_wait()
-        dispatch_done_event = paddle.cuda.Event()
-        dispatch_done_event.record()
 
     if logging:
         print("tokens_per_expert:", tokens_per_expert)
@@ -185,7 +180,7 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
     if begin < end:
         deep_gemm.set_num_sms(0)
         paddle.base.core.nvprof_nvtx_push(f"B{begin}_{end - 1}")
-        grouped_launch(funcs, begin, end, calc_stream, comm_stream, dispatch_done_event)
+        grouped_launch(funcs, begin, end, calc_stream, comm_stream, previous_task_done_event)
         paddle.base.core.nvprof_nvtx_pop()
         deep_gemm.set_num_sms(CALC_NUM_SMS)
 
@@ -218,7 +213,7 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
     # 本来 dispatch 反向应该用 cache_mode, 但目前 cache_mode 无法计算 atomic_to_zip/zip_to_atomic,
     # 因此只能像前向一样再跑一遍, 会浪费一定的通信带宽
     (
-        _, _, _, _, handle, event, do3, _,
+        _, _, _, _, handle, dispatch_done_event, do3, _,
         atomic_to_zip_bwd, zip_to_atomic_bwd, _, task_queue_bwd
     ) = buffer.dispatch(
         dout,
@@ -233,10 +228,6 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
         unzip_alignment=ALIGNMENT,
         unzip_chunk_size=CHUNK,
     )
-
-    with paddle.device.stream_guard(comm_stream):
-        event.current_stream_wait()
-        dispatch_done_event.record()
 
     ############################## GEMM BACKWARD ###############################
 
@@ -283,7 +274,7 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
     if begin < end:
         deep_gemm.set_num_sms(0)
         paddle.base.core.nvprof_nvtx_push(f"B{begin}_{end - 1}")
-        grouped_launch(funcs, begin, end, calc_stream, comm_stream, dispatch_done_event)
+        grouped_launch(funcs, begin, end, calc_stream, comm_stream, previous_task_done_event)
         paddle.base.core.nvprof_nvtx_pop()
         deep_gemm.set_num_sms(CALC_NUM_SMS)
 
