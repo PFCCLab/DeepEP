@@ -7,17 +7,11 @@ import paddle.nn.functional as F
 
 paddle.empty([32, 1024, 1024, 1024], dtype="uint8")
 paddle.set_printoptions(linewidth=200)
-paddle.enable_compat(scope={"deep_ep"})
 
-import deep_ep
-print("deep_ep:", deep_ep.__file__)
+from utils import (
+    deep_ep, deep_gemm, initialize_fleet, configure_buffer, get_buffer, AsyncLoad, grouped_launch
+)
 
-import deep_gemm
-print("deep_gemm:", deep_gemm.__file__)
-
-from utils import initialize_fleet, configure_buffer, get_buffer, AsyncLoad, grouped_launch
-
-# 命名空间冲突已解决, 不再需要断言 paddlefleet_ops 里的 deep_ep/deep_gemm 不可用
 import paddlefleet_ops
 
 E = 8

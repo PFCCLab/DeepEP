@@ -2,7 +2,15 @@ import paddle
 import paddle.distributed as dist
 from paddle.distributed import fleet
 
-import deep_ep
+try:
+    from teramoe import deep_ep, deep_gemm
+except ImportError:
+    paddle.enable_compat(scope={"deep_ep"})
+    import deep_ep
+    import deep_gemm
+
+print("deep_ep:", deep_ep.__file__)
+print("deep_gemm:", deep_gemm.__file__)
 
 
 def initialize_fleet():

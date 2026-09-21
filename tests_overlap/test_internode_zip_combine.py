@@ -6,12 +6,8 @@ import paddle.distributed as dist
 
 paddle.empty([32, 1024, 1024, 1024], "uint8")
 paddle.set_printoptions(linewidth=200)
-paddle.enable_compat(scope={"deep_ep"})
 
-import deep_ep
-print("deep_ep:", deep_ep.__file__)
-
-from utils import initialize_fleet, configure_buffer, get_buffer
+from utils import deep_ep, initialize_fleet, configure_buffer, get_buffer
 
 E = 16
 H = 4096
