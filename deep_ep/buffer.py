@@ -508,7 +508,7 @@ class Buffer:
                 recv_src_meta, send_rdma_head, send_nvl_head = handle
             num_recv_tokens = recv_src_meta.size(0)
             num_rdma_recv_tokens = send_nvl_head.size(0)
-            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
+            recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
                 rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
@@ -521,7 +521,7 @@ class Buffer:
                 recv_rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, \
                 recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, \
                 recv_src_meta, send_rdma_head, send_nvl_head, \
-                unzipped_tokens, unzipped_scales, unzipped_probs, atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue, event = self.runtime.internode_dispatch(
+                unzipped_tokens, unzipped_scales, unzipped_probs, atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue, unzip_overflow_flag, event = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights,
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
@@ -534,7 +534,7 @@ class Buffer:
                    num_recv_tokens_per_expert_list, handle, EventOverlap(event))
             if unzip_alignment > 0:
                 unzipped_x = (unzipped_tokens, unzipped_scales) if x_scales is not None else unzipped_tokens
-                return ret + (unzipped_x, unzipped_probs, atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue)
+                return ret + (unzipped_x, unzipped_probs, atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue, unzip_overflow_flag)
             return ret
 
     # noinspection PyTypeChecker

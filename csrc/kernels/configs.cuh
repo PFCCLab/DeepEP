@@ -10,6 +10,24 @@
 // receiver warps' atomics land on distinct cache lines instead of contending on one or two
 #define NUM_UNZIP_COUNTER_STRIDE 32
 
+// Intra-node compute-compensation: a receiver may multicast a migrated chunk's tokens
+// directly into a PEER rank's fused-unzip buffers over NVLink, so an under-loaded node-local
+// GPU computes a hot expert's chunk. `UnzipPeerBufs` mirrors the local fused-unzip buffer set
+// for one peer; the kernel indexes an array of these by the peer's NVL rank. The feature is
+// OFF unless non-null `unzip_peer_bufs` + `unzip_home` (per-local-expert target NVL rank) are
+// passed, so the default dispatch path stays bit-for-bit unchanged.
+struct UnzipPeerBufs {
+    int4* unzipped_x;
+    float* unzipped_scales;
+    float* unzipped_probs;
+    int* unzipped_expert_counter;
+    const int* unzip_expert_meta;
+    int* unzip_chunk_done;
+    int* task_queue;
+    int* task_queue_counter;
+    int num_unzipped_tokens;
+};
+
 #define FINISHED_SUM_TAG 1024
 #define NUM_WAIT_NANOSECONDS 500
 
