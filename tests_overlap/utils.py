@@ -170,7 +170,6 @@ def grouped_launch(funcs, begin, end, calc_stream, comm_stream, event=None):
             paddle.base.core._set_current_stream(stream_bases[0])
 
 
-relay_stream = paddle.cuda.Stream()  # 仅用于将 deep_ep event 转换为 paddle event
 other_stream = paddle.cuda.Stream()  # 用于 grouped launch 两个流同时发起计算
 
 
@@ -182,12 +181,8 @@ class GroupedTaskLauncher:
         self._next_task_idx = 0
         self._calc_stream = paddle.cuda.current_stream()
         self._comm_stream = other_stream
-        self._dispatch_event = paddle.cuda.Event()
+        self._dispatch_event = dispatch_event
         self._prev_task_event = paddle.cuda.Event()
-
-        with paddle.device.stream_guard(relay_stream):
-            dispatch_event.current_stream_wait()
-            self._dispatch_event.record()
 
     def run_dispatch_overlap(self):
         """阶段A: dispatch 与计算 overlap, 计算只使用部分 SM"""
@@ -265,7 +260,7 @@ class GroupedTaskLauncher:
         if begin < end:
             paddle.base.core.nvprof_nvtx_push(f"B{begin}_{end - 1}")
             grouped_launch(self._funcs, begin, end, self._calc_stream, self._comm_stream,
-                           self._dispatch_event)
+                           self._prev_task_event)
             paddle.base.core.nvprof_nvtx_pop()
 
         self._next_task_idx = end

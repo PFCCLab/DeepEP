@@ -177,7 +177,7 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
 
     (
         recv_x, recv_token_indices, recv_token_probs,
-        num_recv_tokens_per_expert_list, handle, event,
+        num_recv_tokens_per_expert_list, handle, dispatch_done_event,
         unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic,
         num_valid_topk, task_queue, unzip_overflow_flag
     ) = buffer.dispatch(
@@ -203,11 +203,6 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
     # never goes net-negative vs baseline (degrades to dispatch-only overlap). Shared by the
     # forward and backward Stage-B/C split below (same routing => same imbalance).
     combine_ratio = adaptive_combine_ratio(tokens_per_expert)
-
-    with paddle.device.stream_guard(comm_stream):
-        event.current_stream_wait()
-        dispatch_done_event = paddle.cuda.Event()
-        dispatch_done_event.record()
 
     # Localization / fail-safe probe (opt-in via UNZIP_OVERFLOW_CHECK=1, off by default so the
     # overlap hot path pays no host sync). Reading the flag forces the dispatch kernel to finish
@@ -277,7 +272,7 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
     if begin < end:
         deep_gemm.set_num_sms(0)
         paddle.base.core.nvprof_nvtx_push(f"B{begin}_{end - 1}")
-        grouped_launch(funcs, begin, end, calc_stream, comm_stream, dispatch_done_event)
+        grouped_launch(funcs, begin, end, calc_stream, comm_stream, previous_task_done_event)
         paddle.base.core.nvprof_nvtx_pop()
         deep_gemm.set_num_sms(CALC_NUM_SMS)
 
@@ -312,7 +307,7 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
     # 本来 dispatch 反向应该用 cache_mode, 但目前 cache_mode 无法计算 atomic_to_zip/zip_to_atomic,
     # 因此只能像前向一样再跑一遍, 会浪费一定的通信带宽
     (
-        _, _, _, _, handle, event, do3, _,
+        _, _, _, _, handle, dispatch_done_event, do3, _,
         atomic_to_zip_bwd, zip_to_atomic_bwd, _, task_queue_bwd, unzip_overflow_flag_bwd
     ) = buffer.dispatch(
         dout,
@@ -327,10 +322,6 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
         unzip_alignment=ALIGNMENT,
         unzip_chunk_size=CHUNK,
     )
-
-    with paddle.device.stream_guard(comm_stream):
-        event.current_stream_wait()
-        dispatch_done_event.record()
 
     # Same opt-in localization / fail-safe probe as the forward dispatch above.
     if os.environ.get("UNZIP_OVERFLOW_CHECK", "0") == "1":
@@ -386,7 +377,7 @@ def run_overlap(group, buffer, hidden_states, token_probs, token_indices, dout, 
     if begin < end:
         deep_gemm.set_num_sms(0)
         paddle.base.core.nvprof_nvtx_push(f"B{begin}_{end - 1}")
-        grouped_launch(funcs, begin, end, calc_stream, comm_stream, dispatch_done_event)
+        grouped_launch(funcs, begin, end, calc_stream, comm_stream, previous_task_done_event)
         paddle.base.core.nvprof_nvtx_pop()
         deep_gemm.set_num_sms(CALC_NUM_SMS)
 

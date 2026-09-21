@@ -2098,7 +2098,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     pybind11::class_<deep_ep::EventHandle>(m, "EventHandle", py::module_local())
         .def(pybind11::init<>())
-        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
+        .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait)
+        .def("query", &deep_ep::EventHandle::query);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer", py::module_local())
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool, int>())
