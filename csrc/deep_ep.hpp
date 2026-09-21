@@ -90,6 +90,13 @@ private:
     // Declared after the contexts because its constructor lambda assigns them.
     at::cuda::CUDAStream comm_stream;
 
+    // Dedicated copy-engine stream for compensation migration (peer_copy_out), lazily created.
+    cudaStream_t migrate_stream = nullptr;
+    // Dedicated scratch buffers for scratch_dma (lazily cudaMalloc'd, never the comm buffer).
+    void* scratch_a = nullptr;
+    void* scratch_b = nullptr;
+    int64_t scratch_bytes = 0;
+
     // After IPC/NVSHMEM synchronization, this flag will be true
     bool available = false;
 
@@ -157,6 +164,31 @@ public:
     torch::Stream get_comm_stream() const {
         return comm_stream;
     }
+
+    // Intra-node compute-compensation transport: copy a local buffer to peer `dst_nvl_rank`'s
+    // IPC-shared symmetric buffer over NVLink via the COPY ENGINE (cudaMemcpyAsync DeviceToDevice;
+    // peer access already enabled at IPC-open). Uses a dedicated copy stream (0 SM). Returns the
+    // median ms over `iters`. This is the real copy-engine migration primitive.
+    double peer_copy_bench(int dst_nvl_rank, int64_t nbytes, int iters);
+
+    // Real copy-engine migration transport (0 SM): copy a local device buffer `src_ptr`
+    // into peer `dst_nvl_rank`'s IPC-shared symmetric NVL buffer at byte `dst_offset`,
+    // enqueued async on a dedicated migrate stream (cudaMemcpyAsync DeviceToDevice; peer
+    // access already enabled at IPC-open). This wires intra-node compute-compensation
+    // migration onto the copy engine instead of NCCL (no SM contention, no NCCL rendezvous).
+    // Call `migrate_sync()` to wait for all enqueued copies.
+    void peer_copy_out(int dst_nvl_rank, int64_t dst_offset, int64_t src_ptr, int64_t nbytes);
+    // Copy-engine read of the local symmetric NVL buffer: buffer[src_offset] -> local `dst_ptr`
+    // (device-to-device on the migrate stream). Lets a helper pull staged bytes into a normal,
+    // correctly-typed device tensor without relying on get_local_buffer_tensor's dtype mapping.
+    void buffer_copy_out(int64_t src_offset, int64_t dst_ptr, int64_t nbytes);
+    // 0-SM copy-engine DMA on the migrate stream between DEDICATED scratch buffers (lazily
+    // cudaMalloc'd, never the comm symmetric buffer). Used to occupy the copy engine with a
+    // realistic migration volume CONCURRENTLY with run_overlap, to measure hideability without
+    // corrupting the live dispatch/combine buffer. Call migrate_sync() to wait.
+    void scratch_dma(int64_t nbytes);
+    void migrate_sync();
+
     
     void sync(const std::vector<int>& device_ids,
               const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
@@ -226,6 +258,7 @@ public:
                torch::Tensor,
                std::optional<torch::Tensor>,
                torch::Tensor,
+               std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,

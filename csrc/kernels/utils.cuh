@@ -99,6 +99,21 @@ __device__ __forceinline__ int atomic_add_release_gpu(const int* ptr, int val) {
     return ret;
 }
 
+// An acquire-release `atomicAdd`. Unlike the release-only form, the caller also *acquires* the
+// release sequence of every prior RMW on the same counter, so all those callers' preceding writes
+// become visible to this thread. Used by the fused-unzip chunk-completion counter: the writers of a
+// chunk are spread over many warps/SMs, and the last one to arrive must inherit every other writer's
+// token/probs/mapping-table stores before it publishes the chunk's `ready` flag -- otherwise a
+// concurrently-overlapped consumer that acquires `ready` is not guaranteed to see those stores. The
+// hole is timing-dependent: at low skew the writers retire before the consumer looks, but high skew
+// widens the window and surfaces it as a silent out-of-bounds gather (CUDA 719) on stale mapping
+// tables. One acquire per chunk (not per token) makes it correct at every skew with no serialization.
+__device__ __forceinline__ int atomic_add_acqrel_gpu(const int* ptr, int val) {
+    int ret;
+    asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(val) : "memory");
+    return ret;
+}
+
 __device__ __forceinline__ int ld_acquire_sys_global(const int* ptr) {
     int ret;
     asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));

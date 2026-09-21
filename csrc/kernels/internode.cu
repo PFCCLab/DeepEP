@@ -491,7 +491,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
              int* task_queue,
              int* task_queue_counter,
              int unzip_chunk_size,
-             int num_unzipped_tokens) {
+             int num_unzipped_tokens,
+             const UnzipPeerBufs* unzip_peer_bufs,
+             const int* unzip_home,
+             int* unzip_overflow_flag) {
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
 
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -1227,34 +1230,83 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                     // per token and each lane's completion wait covers exactly its own copy
                     // NOTES: a token never selects the same expert twice, so the lanes never collide
                     if (local_expert_idx >= 0) {
-                        auto slot = atomicAdd(unzipped_expert_counter + local_expert_idx * NUM_UNZIP_COUNTER_STRIDE, 1);
-                        auto unzipped_idx = static_cast<int64_t>(expert_base) + slot;
+                        // Compute-compensation: a migrated chunk is multicast into a PEER rank's
+                        // fused-unzip buffers (over NVLink) so an idle node-local GPU computes it.
+                        // `unzip_home[e]` gives the target NVL rank; OFF (null) => always local.
+                        const int nvl_rank_local = rank % NUM_MAX_NVL_PEERS;
+                        const int home = (unzip_home != nullptr) ? unzip_home[local_expert_idx] : nvl_rank_local;
+                        const bool to_peer = (unzip_peer_bufs != nullptr) and (home != nvl_rank_local);
 
-                        tma_store_1d(tma_buffer, unzipped_x + unzipped_idx * hidden_int4, hidden_bytes, false);
+                        int4* t_x = unzipped_x;
+                        float* t_scales = unzipped_scales;
+                        float* t_probs = unzipped_probs;
+                        int* t_cnt = unzipped_expert_counter;
+                        int* t_done = unzip_chunk_done;
+                        int* t_tq = task_queue;
+                        int* t_tqc = task_queue_counter;
+                        int t_num_unzipped = num_unzipped_tokens;
+                        int e_base = expert_base, e_count = expert_count, e_chunk_base = expert_chunk_base;
+                        if (to_peer) {
+                            const auto& pb = unzip_peer_bufs[home];
+                            t_x = pb.unzipped_x; t_scales = pb.unzipped_scales; t_probs = pb.unzipped_probs;
+                            t_cnt = pb.unzipped_expert_counter; t_done = pb.unzip_chunk_done;
+                            t_tq = pb.task_queue; t_tqc = pb.task_queue_counter;
+                            t_num_unzipped = pb.num_unzipped_tokens;
+                            e_base = ld_nc_global(pb.unzip_expert_meta + local_expert_idx * 3);
+                            e_count = ld_nc_global(pb.unzip_expert_meta + local_expert_idx * 3 + 1);
+                            e_chunk_base = ld_nc_global(pb.unzip_expert_meta + local_expert_idx * 3 + 2);
+                        }
+
+                        auto slot = atomicAdd(t_cnt + local_expert_idx * NUM_UNZIP_COUNTER_STRIDE, 1);
+
+                        // Fail-safe: `slot` is the write index inside this expert's region of the
+                        // fused-unzip buffers, which were provisioned for exactly `e_count` tokens
+                        // (deep_ep.cpp sizes them from the CPU-synced recv counts). Under normal
+                        // routing `slot < e_count` always holds, so the guard is a no-op and the
+                        // path stays bit-exact. If workload skew ever drives more arrivals than the
+                        // provisioning (or a mis-provisioning bug exists), writing at `slot` would
+                        // run off the end of `unzipped_x`/`unzip_chunk_done`/`task_queue` and MMU-
+                        // fault the GPU (Xid43 -> unrecoverable CUDA 719, wedging the device). Instead
+                        // we drop the over-count token and record the offending expert so the host can
+                        // raise a clean, catchable error. The chunk-completion protocol below is keyed
+                        // on `e_count`, so the legitimate slots [0, e_count) still fill every chunk and
+                        // enqueue their tasks -- dropping the surplus cannot hang the compute side.
+                        if (slot >= e_count) {
+                            if (unzip_overflow_flag != nullptr)
+                                atomicMax(unzip_overflow_flag, local_expert_idx + 1);  // 1-based; 0 = no overflow
+                        } else {
+                        auto unzipped_idx = static_cast<int64_t>(e_base) + slot;
+
+                        tma_store_1d(tma_buffer, t_x + unzipped_idx * hidden_int4, hidden_bytes, false);
 
                         // FP8: the scales travel with the token, so multicast them the same way
                         // NOTES: the aligned case reuses the scales already loaded into smem next to the
                         // token; otherwise this lane copies them from the NVL buffer, which is still
                         // valid because the channel head is only moved after the whole chunk is done
-                        if (unzipped_scales != nullptr) {
+                        if (t_scales != nullptr) {
                             if (scale_aligned) {
                                 for (int i = 0; i < num_scales; ++i)
-                                    st_na_global(unzipped_scales + unzipped_idx + i * num_unzipped_tokens,
+                                    st_na_global(t_scales + unzipped_idx + i * t_num_unzipped,
                                                  reinterpret_cast<const float*>(tma_buffer + hidden_bytes)[i]);
                             } else {
                                 for (int i = 0; i < num_scales; ++i)
-                                    st_na_global(unzipped_scales + unzipped_idx + i * num_unzipped_tokens,
+                                    st_na_global(t_scales + unzipped_idx + i * t_num_unzipped,
                                                  ld_nc_global(nvl_scales + i));
                             }
                         }
 
-                        st_na_global(unzipped_probs + unzipped_idx, local_expert_prob);
-                        st_na_global(atomic_to_zip + unzipped_idx, static_cast<int>(recv_token_idx));
-                        st_na_global(zip_to_atomic + recv_token_idx * num_topk + lane_id, static_cast<int>(unzipped_idx));
+                        st_na_global(t_probs + unzipped_idx, local_expert_prob);
 
-                        // Every hit lane writes the same value to the same address, so that whichever
-                        // of this token's chunks becomes ready first already carries the count
-                        st_na_global(num_valid_topk + recv_token_idx, num_hits);
+                        // The DeepEP-order mapping tables are only meaningful in the OWNER's recv
+                        // order; a migrated chunk is re-assembled on the owner via write-back, so
+                        // they are written only for locally-computed (non-migrated) tokens.
+                        if (not to_peer) {
+                            st_na_global(atomic_to_zip + unzipped_idx, static_cast<int>(recv_token_idx));
+                            st_na_global(zip_to_atomic + recv_token_idx * num_topk + lane_id, static_cast<int>(unzipped_idx));
+                            // Every hit lane writes the same value to the same address, so that whichever
+                            // of this token's chunks becomes ready first already carries the count
+                            st_na_global(num_valid_topk + recv_token_idx, num_hits);
+                        }
 
                         // Wait for our own copy to land, so that the release below has something
                         // complete to publish
@@ -1265,27 +1317,30 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                         // whoever happens to finish last enqueue the task
                         auto chunk_in_expert = slot / unzip_chunk_size;
                         auto chunk_begin = chunk_in_expert * unzip_chunk_size;
-                        auto chunk_size = min(unzip_chunk_size, expert_count - chunk_begin);
+                        auto chunk_size = min(unzip_chunk_size, e_count - chunk_begin);
 
                         // Release point: everything written above becomes visible device-wide before the
-                        // counter does, because a concurrently running consumer acquires through `task_queue`
-                        auto num_done = atomic_add_release_gpu(unzip_chunk_done + expert_chunk_base + chunk_in_expert, 1);
+                        // counter does, because a concurrently running consumer acquires through `task_queue`.
+                        // NOTES: acquire-release (not release-only) so the last writer inherits every other
+                        //        writer's token/probs/mapping-table stores for this chunk before it publishes
+                        //        `ready`; a release-only RMW leaves those stores un-acquired and a consumer
+                        //        overlapped with dispatch can gather stale mapping tables (silent OOB / 719).
+                        //        The window only opens under high skew, hence bit-exact at low skew before.
+                        auto num_done = atomic_add_acqrel_gpu(t_done + e_chunk_base + chunk_in_expert, 1);
                         if (num_done + 1 == chunk_size) {
-                            // The acquire side, so that the other writers' releases are inherited and carried
-                            // over to the consumer by the `ready` store below. Only the last writer of a chunk
-                            // needs it, so this fence is paid per chunk rather than per token
-                            // NOTES: on current hardware this looks redundant, as observing their releases
-                            // already implies their data reached L2; it is here for the memory model's sake
-                            // and would become load-bearing if this branch ever reads the chunk's data
+                            // The acquire above already carried the other writers' releases into this thread;
+                            // this fence then orders them (and our own stores) ahead of the `ready` store below.
+                            // Only the last writer of a chunk needs it, so this fence is paid per chunk.
                             __threadfence();
 
                             // NOTES: the queue must stay FIFO for the compute side, hence the push counter
-                            auto entry = task_queue + atomicAdd(task_queue_counter, 1) * 4;
+                            auto entry = t_tq + atomicAdd(t_tqc, 1) * 4;
                             st_na_global(entry + 0, local_expert_idx);
-                            st_na_global(entry + 1, expert_base + chunk_begin);
+                            st_na_global(entry + 1, e_base + chunk_begin);
                             st_na_global(entry + 2, chunk_size);
                             st_release_sys_global(entry + 3, 1);
                         }
+                        }  // else (slot < e_count)
                     }
                     __syncwarp();
                 }
@@ -1368,7 +1423,10 @@ void dispatch(void* recv_x,
               int* task_queue,
               int* task_queue_counter,
               int unzip_chunk_size,
-              int num_unzipped_tokens) {
+              int num_unzipped_tokens,
+              const UnzipPeerBufs* unzip_peer_bufs,
+              const int* unzip_home,
+              int* unzip_overflow_flag) {
     constexpr int kNumDispatchRDMASenderWarps = 7;
     constexpr int kNumTMABytesPerWarp = 16384;
     constexpr int smem_size = kNumTMABytesPerWarp * NUM_MAX_NVL_PEERS;
@@ -1432,7 +1490,10 @@ void dispatch(void* recv_x,
                       task_queue,                                                                                              \
                       task_queue_counter,                                                                                      \
                       unzip_chunk_size,                                                                                        \
-                      num_unzipped_tokens);                                                                                    \
+                      num_unzipped_tokens,                                                                                     \
+                      unzip_peer_bufs,                                                                                         \
+                      unzip_home,                                                                                             \
+                      unzip_overflow_flag);                                                                                   \
     }                                                                                                                          \
     break
 

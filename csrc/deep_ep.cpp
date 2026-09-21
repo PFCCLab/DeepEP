@@ -9,6 +9,8 @@
 
 #include <chrono>
 #include <memory>
+#include <algorithm>
+#include <vector>
 
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
@@ -285,6 +287,81 @@ torch::Tensor Buffer::get_local_buffer_tensor(const pybind11::object& dtype, int
     auto base_ptr = static_cast<uint8_t*>(use_rdma_buffer ? rdma_buffer_ptr : buffer_ptrs[nvl_rank]) + offset;
     auto num_bytes = use_rdma_buffer ? num_rdma_bytes : num_nvl_bytes;
     return torch::from_blob(base_ptr, num_bytes / element_bytes, torch::TensorOptions().dtype(casted_dtype).device(at::kCUDA));
+}
+
+double Buffer::peer_copy_bench(int dst_nvl_rank, int64_t nbytes, int iters) {
+    // Real copy-engine P2P: local staging -> peer's IPC symmetric buffer over NVLink.
+    // buffer_ptrs[dst_nvl_rank] is peer-mapped (cudaIpcOpenMemHandle, LazyEnablePeerAccess),
+    // so cudaMemcpyAsync(DeviceToDevice) is a copy-engine DMA over NVLink (no SMs).
+    EP_HOST_ASSERT(dst_nvl_rank >= 0 and dst_nvl_rank < num_nvl_ranks);
+    EP_HOST_ASSERT(nbytes > 0 and nbytes <= num_nvl_bytes);
+    void* src = nullptr;
+    CUDA_CHECK(cudaMalloc(&src, nbytes));
+    void* dst = buffer_ptrs[dst_nvl_rank];   // peer's symmetric buffer (self if dst==nvl_rank)
+    cudaStream_t copy_stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
+    cudaEvent_t beg, end;
+    CUDA_CHECK(cudaEventCreate(&beg)); CUDA_CHECK(cudaEventCreate(&end));
+    for (int i = 0; i < 5; ++i)   // warmup
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToDevice, copy_stream));
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream));
+    std::vector<float> ts;
+    for (int i = 0; i < iters; ++i) {
+        CUDA_CHECK(cudaEventRecord(beg, copy_stream));
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToDevice, copy_stream));
+        CUDA_CHECK(cudaEventRecord(end, copy_stream));
+        CUDA_CHECK(cudaEventSynchronize(end));
+        float ms = 0; CUDA_CHECK(cudaEventElapsedTime(&ms, beg, end));
+        ts.push_back(ms);
+    }
+    CUDA_CHECK(cudaEventDestroy(beg)); CUDA_CHECK(cudaEventDestroy(end));
+    CUDA_CHECK(cudaStreamDestroy(copy_stream));
+    CUDA_CHECK(cudaFree(src));
+    std::sort(ts.begin(), ts.end());
+    return ts[ts.size() / 2];
+}
+
+void Buffer::peer_copy_out(int dst_nvl_rank, int64_t dst_offset, int64_t src_ptr, int64_t nbytes) {
+    // Copy-engine migration send: local `src_ptr` -> peer's symmetric NVL buffer at byte offset.
+    // Enqueued async on a dedicated 0-SM copy stream; peer access is already enabled at IPC-open.
+    EP_HOST_ASSERT(dst_nvl_rank >= 0 and dst_nvl_rank < num_nvl_ranks);
+    EP_HOST_ASSERT(dst_offset >= 0 and dst_offset + nbytes <= num_nvl_bytes);
+    if (migrate_stream == nullptr)
+        CUDA_CHECK(cudaStreamCreateWithFlags(&migrate_stream, cudaStreamNonBlocking));
+    void* dst = static_cast<uint8_t*>(buffer_ptrs[dst_nvl_rank]) + dst_offset;
+    CUDA_CHECK(cudaMemcpyAsync(dst, reinterpret_cast<void*>(src_ptr), nbytes,
+                               cudaMemcpyDeviceToDevice, migrate_stream));
+}
+
+void Buffer::migrate_sync() {
+    if (migrate_stream != nullptr)
+        CUDA_CHECK(cudaStreamSynchronize(migrate_stream));
+}
+
+void Buffer::scratch_dma(int64_t nbytes) {
+    // 0-SM copy-engine DMA between dedicated scratch buffers on the migrate stream. Lazily
+    // (re)allocates scratch to fit nbytes. Never touches the comm symmetric buffer.
+    if (nbytes <= 0) return;
+    if (migrate_stream == nullptr)
+        CUDA_CHECK(cudaStreamCreateWithFlags(&migrate_stream, cudaStreamNonBlocking));
+    if (nbytes > scratch_bytes) {
+        if (scratch_a != nullptr) CUDA_CHECK(cudaFree(scratch_a));
+        if (scratch_b != nullptr) CUDA_CHECK(cudaFree(scratch_b));
+        CUDA_CHECK(cudaMalloc(&scratch_a, nbytes));
+        CUDA_CHECK(cudaMalloc(&scratch_b, nbytes));
+        scratch_bytes = nbytes;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(scratch_b, scratch_a, nbytes, cudaMemcpyDeviceToDevice, migrate_stream));
+}
+
+void Buffer::buffer_copy_out(int64_t src_offset, int64_t dst_ptr, int64_t nbytes) {
+    // Copy-engine read: local symmetric NVL buffer[src_offset] -> local dst_ptr (D2D, 0 SM).
+    EP_HOST_ASSERT(src_offset >= 0 and src_offset + nbytes <= num_nvl_bytes);
+    if (migrate_stream == nullptr)
+        CUDA_CHECK(cudaStreamCreateWithFlags(&migrate_stream, cudaStreamNonBlocking));
+    void* src = static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + src_offset;
+    CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(dst_ptr), src, nbytes,
+                               cudaMemcpyDeviceToDevice, migrate_stream));
 }
 
 
@@ -959,6 +1036,7 @@ std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
            std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
            std::optional<EventHandle>>
 Buffer::internode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& x_scales,
@@ -1250,6 +1328,11 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     auto unzip_chunk_done = std::optional<torch::Tensor>();
     auto task_queue = std::optional<torch::Tensor>();
     auto task_queue_counter = std::optional<torch::Tensor>();
+    // Fail-safe overflow flag: the fused-unzip kernel sets this (to offending_expert+1) if any
+    // token's write slot would exceed its expert's provisioned region, instead of writing OOB and
+    // MMU-faulting the GPU (Xid43 -> unrecoverable CUDA 719). Read back by Python after compute to
+    // raise a clean, catchable error. `int32[1]`, zeroed each dispatch. 0 => no overflow.
+    auto unzip_overflow_flag = std::optional<torch::Tensor>();
     int num_chunks = 0;
     int num_unzipped_tokens = 0;
     if (unzip_alignment > 0) {
@@ -1296,6 +1379,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         unzip_chunk_done = torch::empty({std::max(num_chunks, 1)}, dtype(torch::kInt32).device(torch::kCUDA));
         task_queue = torch::empty({std::max(num_chunks, 1), 4}, dtype(torch::kInt32).device(torch::kCUDA));
         task_queue_counter = torch::empty({1}, dtype(torch::kInt32).device(torch::kCUDA));
+        unzip_overflow_flag = torch::zeros({1}, dtype(torch::kInt32).device(torch::kCUDA));
         CUDA_CHECK(cudaMemsetAsync(unzipped_expert_counter->data_ptr<int>(), 0, sizeof(int) * num_counter_ints, comm_stream));
         CUDA_CHECK(cudaMemsetAsync(unzip_chunk_done->data_ptr<int>(), 0, sizeof(int) * std::max(num_chunks, 1), comm_stream));
         CUDA_CHECK(cudaMemsetAsync(task_queue->data_ptr<int>(), 0, sizeof(int) * std::max(num_chunks, 1) * 4, comm_stream));
@@ -1359,7 +1443,10 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                         task_queue.has_value() ? task_queue->data_ptr<int>() : nullptr,
                         task_queue_counter.has_value() ? task_queue_counter->data_ptr<int>() : nullptr,
                         unzip_chunk_size,
-                        num_unzipped_tokens);
+                        num_unzipped_tokens,
+                        nullptr /* unzip_peer_bufs */,
+                        nullptr /* unzip_home */,
+                        unzip_overflow_flag.has_value() ? unzip_overflow_flag->data_ptr<int>() : nullptr);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1401,6 +1488,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                          zip_to_atomic,
                          num_valid_topk,
                          task_queue,
+                         unzip_overflow_flag,
                          // NOTES: non-returned tensors must be recorded on comm_stream to keep
                          // them alive util dispatch finishes
                          unzipped_expert_counter,
@@ -1442,6 +1530,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
             zip_to_atomic,
             num_valid_topk,
             task_queue,
+            unzip_overflow_flag,
             event};
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
@@ -2021,6 +2110,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_local_ipc_handle", &deep_ep::Buffer::get_local_ipc_handle)
         .def("get_local_nvshmem_unique_id", &deep_ep::Buffer::get_local_nvshmem_unique_id)
         .def("get_local_buffer_tensor", &deep_ep::Buffer::get_local_buffer_tensor)
+        .def("peer_copy_bench", &deep_ep::Buffer::peer_copy_bench)
+        .def("peer_copy_out", &deep_ep::Buffer::peer_copy_out)
+        .def("buffer_copy_out", &deep_ep::Buffer::buffer_copy_out)
+        .def("scratch_dma", &deep_ep::Buffer::scratch_dma)
+        .def("migrate_sync", &deep_ep::Buffer::migrate_sync)
         .def("get_comm_stream",
            [](deep_ep::Buffer &self) {
              int device_id = self.get_local_device_id();
