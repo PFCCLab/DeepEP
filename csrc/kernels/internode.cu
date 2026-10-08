@@ -1145,6 +1145,21 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 }
             }
 
+            int staged_expert_idx, staged_chunk_offset, staged_chunk_size;
+            int staged_chunk_idx = -1;
+            const auto release_token = [&]() {
+                // Wait TMA to be actually written. This is different from tma_store_wait
+                tma_store_wait_complete<0>();
+                auto num_done = atomic_add_release_gpu(unzip_chunk_done + staged_chunk_idx, 1);
+                if (num_done + 1 == staged_chunk_size) {
+                    auto entry = task_queue + atomicAdd(task_queue_counter, 1) * 4;
+                    st_na_global(entry + 0, staged_expert_idx);
+                    st_na_global(entry + 1, staged_chunk_offset);
+                    st_na_global(entry + 2, staged_chunk_size);
+                    st_na_release(entry + 3, 1);
+                }
+            };
+
             // Copy data
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
             for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++chunk_idx, --num_tokens_to_recv) {
@@ -1162,6 +1177,10 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 if (elect_one_sync()) {
                     tma_load_1d(tma_buffer, shifted, tma_mbarrier, tma_load_bytes);
                     mbarrier_arrive_and_expect_tx(tma_mbarrier, tma_load_bytes);
+                }
+                if (staged_chunk_idx != -1) {
+                    release_token();
+                    staged_chunk_idx = -1;
                 }
                 __syncwarp();
                 mbarrier_wait(tma_mbarrier, tma_phase);
@@ -1211,7 +1230,6 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 }
 
                 // Multicast the token into each of its local experts' region of `unzipped_x` (fused unzip)
-                // NOTES: the slot inside a region is grabbed atomically, so the order is non-deterministic
                 if (unzipped_x != nullptr) {
                     // Broadcast the hit experts' metadata before diverging, as all the lanes must
                     // take part in the shuffles
@@ -1223,9 +1241,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                     // How many local experts this token hits
                     auto num_hits = __popc(__ballot_sync(0xffffffff, local_expert_idx >= 0));
 
-                    // Every hit lane issues its own copy, so the warp pays a single atomic round-trip
-                    // per token and each lane's completion wait covers exactly its own copy
-                    // NOTES: a token never selects the same expert twice, so the lanes never collide
+                    // Every hit lane issues its own copy
                     if (local_expert_idx >= 0) {
                         auto slot = atomicAdd(unzipped_expert_counter + local_expert_idx * NUM_UNZIP_COUNTER_STRIDE, 1);
                         auto unzipped_idx = static_cast<int64_t>(expert_base) + slot;
@@ -1256,36 +1272,13 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                         // of this token's chunks becomes ready first already carries the count
                         st_na_global(num_valid_topk + recv_token_idx, num_hits);
 
-                        // Wait for our own copy to land, so that the release below has something
-                        // complete to publish
-                        tma_store_wait_complete<0>();
-
-                        // A chunk is only complete once all of its slots are written, and the writers
-                        // are spread over many warps and SMs, so count the completions per chunk and let
-                        // whoever happens to finish last enqueue the task
+                        // Stage the token release signal until this lane receives the next token
                         auto chunk_in_expert = slot / unzip_chunk_size;
                         auto chunk_begin = chunk_in_expert * unzip_chunk_size;
-                        auto chunk_size = min(unzip_chunk_size, expert_count - chunk_begin);
-
-                        // Release point: everything written above becomes visible device-wide before the
-                        // counter does, because a concurrently running consumer acquires through `task_queue`
-                        auto num_done = atomic_add_release_gpu(unzip_chunk_done + expert_chunk_base + chunk_in_expert, 1);
-                        if (num_done + 1 == chunk_size) {
-                            // The acquire side, so that the other writers' releases are inherited and carried
-                            // over to the consumer by the `ready` store below. Only the last writer of a chunk
-                            // needs it, so this fence is paid per chunk rather than per token
-                            // NOTES: on current hardware this looks redundant, as observing their releases
-                            // already implies their data reached L2; it is here for the memory model's sake
-                            // and would become load-bearing if this branch ever reads the chunk's data
-                            __threadfence();
-
-                            // NOTES: the queue must stay FIFO for the compute side, hence the push counter
-                            auto entry = task_queue + atomicAdd(task_queue_counter, 1) * 4;
-                            st_na_global(entry + 0, local_expert_idx);
-                            st_na_global(entry + 1, expert_base + chunk_begin);
-                            st_na_global(entry + 2, chunk_size);
-                            st_release_sys_global(entry + 3, 1);
-                        }
+                        staged_expert_idx = local_expert_idx;
+                        staged_chunk_offset = expert_base + chunk_begin;
+                        staged_chunk_size = min(unzip_chunk_size, expert_count - chunk_begin);
+                        staged_chunk_idx = expert_chunk_base + chunk_in_expert;
                     }
                     __syncwarp();
                 }
@@ -1294,6 +1287,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 tma_store_wait<0>();
                 __syncwarp();
             }
+
+            if (staged_chunk_idx != -1)
+                release_token();
 
             // Move queue
             if (elect_one_sync())
