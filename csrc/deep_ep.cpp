@@ -1290,13 +1290,13 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         num_valid_topk = torch::empty({num_recv_tokens}, dtype(torch::kInt32).device(torch::kCUDA));
         CUDA_CHECK(cudaMemsetAsync(num_valid_topk->data_ptr<int>(), 0, sizeof(int) * num_recv_tokens, comm_stream));
 
-        // NOTES: the slot counters are strided so that they do not share cache lines
-        auto num_counter_ints = num_local_experts * NUM_UNZIP_COUNTER_STRIDE;
-        unzipped_expert_counter = torch::empty({num_counter_ints}, dtype(torch::kInt32).device(torch::kCUDA));
+        unzipped_expert_counter = torch::empty({num_local_experts}, dtype(torch::kInt32).device(torch::kCUDA));
         unzip_chunk_done = torch::empty({num_chunks}, dtype(torch::kInt32).device(torch::kCUDA));
         task_queue = torch::empty({num_chunks, 4}, dtype(torch::kInt32).device(torch::kCUDA));
-        task_queue_counter = torch::empty({1}, dtype(torch::kInt32).device(torch::kCUDA));
-        CUDA_CHECK(cudaMemsetAsync(unzipped_expert_counter->data_ptr<int>(), 0, sizeof(int) * num_counter_ints, comm_stream));
+        auto stage_buffer_size = num_channels * NUM_MAX_NVL_PEERS * NUM_BATCH_RELEASE_TOKENS * 4;
+        task_queue_counter = torch::empty({1 + stage_buffer_size}, dtype(torch::kInt32).device(torch::kCUDA));
+
+        CUDA_CHECK(cudaMemsetAsync(unzipped_expert_counter->data_ptr<int>(), 0, sizeof(int) * num_local_experts, comm_stream));
         CUDA_CHECK(cudaMemsetAsync(unzip_chunk_done->data_ptr<int>(), 0, sizeof(int) * num_chunks, comm_stream));
         CUDA_CHECK(cudaMemsetAsync(task_queue->data_ptr<int>(), 0, sizeof(int) * num_chunks * 4, comm_stream));
         CUDA_CHECK(cudaMemsetAsync(task_queue_counter->data_ptr<int>(), 0, sizeof(int), comm_stream));

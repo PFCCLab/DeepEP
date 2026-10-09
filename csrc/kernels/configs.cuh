@@ -5,10 +5,7 @@
 #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
 #define NUM_MAX_LOCAL_EXPERTS 1024
 #define NUM_BUFFER_ALIGNMENT_BYTES 128
-
-// Stride (in `int`s) between two adjacent fused-unzip per-expert counters, so that all the
-// receiver warps' atomics land on distinct cache lines instead of contending on one or two
-#define NUM_UNZIP_COUNTER_STRIDE 32
+#define NUM_BATCH_RELEASE_TOKENS 128
 
 #define FINISHED_SUM_TAG 1024
 #define NUM_WAIT_NANOSECONDS 500

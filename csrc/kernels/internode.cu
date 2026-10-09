@@ -1073,6 +1073,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         const int num_local_experts = num_experts / num_ranks;
         const int local_expert_begin = rank * num_local_experts;
         const int local_expert_end = local_expert_begin + num_local_experts;
+        auto* stage_buffer = task_queue_counter + 1 + (channel_id * NUM_MAX_NVL_PEERS + src_nvl_rank) * NUM_BATCH_RELEASE_TOKENS * 4;
 
         // Cache each local expert's fused-unzip metadata, one lane per expert
         int cached_unzip_base = 0, cached_unzip_count = 0, cached_unzip_chunk_base = 0;
@@ -1145,18 +1146,26 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 }
             }
 
-            int staged_expert_idx, staged_chunk_offset, staged_chunk_size;
-            int staged_chunk_idx = -1;
-            const auto release_token = [&]() {
+            int stage_buffer_idx = 0;
+            const auto release_staged_tokens = [&]() {
                 // Wait TMA to be actually written. This is different from tma_store_wait
                 tma_store_wait_complete<0>();
-                auto num_done = atomic_add_release_gpu(unzip_chunk_done + staged_chunk_idx, 1);
-                if (num_done + 1 == staged_chunk_size) {
-                    auto entry = task_queue + atomicAdd(task_queue_counter, 1) * 4;
-                    st_na_global(entry + 0, staged_expert_idx);
-                    st_na_global(entry + 1, staged_chunk_offset);
-                    st_na_global(entry + 2, staged_chunk_size);
-                    st_na_release(entry + 3, 1);
+                __syncwarp();
+
+                for (int i = lane_id; i < stage_buffer_idx; i += 32) {
+                    auto staged_expert_idx = stage_buffer[i];
+                    auto staged_chunk_offset = stage_buffer[i + NUM_BATCH_RELEASE_TOKENS];
+                    auto staged_chunk_size = stage_buffer[i + NUM_BATCH_RELEASE_TOKENS * 2];
+                    auto staged_chunk_idx = stage_buffer[i + NUM_BATCH_RELEASE_TOKENS * 3];
+
+                    auto num_done = atomic_add_release_gpu(unzip_chunk_done + staged_chunk_idx, 1);
+                    if (num_done + 1 == staged_chunk_size) {
+                        auto entry = task_queue + atomicAdd(task_queue_counter, 1) * 4;
+                        st_na_global(entry + 0, staged_expert_idx);
+                        st_na_global(entry + 1, staged_chunk_offset);
+                        st_na_global(entry + 2, staged_chunk_size);
+                        st_na_release(entry + 3, 1);
+                    }
                 }
             };
 
@@ -1173,16 +1182,38 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 auto tma_load_bytes = hidden_bytes + (scale_aligned ? scale_bytes : 0);
                 auto nvl_scales = reinterpret_cast<const float*>(shifted + hidden_bytes);
 
-                // Copy data
+                // Load data
                 if (elect_one_sync()) {
                     tma_load_1d(tma_buffer, shifted, tma_mbarrier, tma_load_bytes);
                     mbarrier_arrive_and_expect_tx(tma_mbarrier, tma_load_bytes);
                 }
-                if (staged_chunk_idx != -1) {
-                    release_token();
-                    staged_chunk_idx = -1;
-                }
                 __syncwarp();
+
+                // Copy `topk_idx` and `topk_weights` in overlap with TMA load
+                int local_expert_idx = -1;
+                float local_expert_prob;
+                int slot;
+                if (lane_id < num_topk) {
+                    // Read
+                    auto shifted1 = shifted + hidden_bytes + scale_bytes + sizeof(SourceMeta);
+                    auto idx_value = static_cast<topk_idx_t>(ld_nc_global(reinterpret_cast<int*>(shifted1) + lane_id));
+                    auto weight_value = ld_nc_global(reinterpret_cast<float*>(shifted1 + sizeof(int) * num_topk) + lane_id);
+                    auto recv_idx = recv_token_idx * num_topk + lane_id;
+
+                    // Transform and write
+                    idx_value = (idx_value >= local_expert_begin and idx_value < local_expert_end) ? idx_value - local_expert_begin : -1;
+                    weight_value = idx_value >= 0 ? weight_value : 0.0f;
+                    st_na_global(recv_topk_idx + recv_idx, idx_value);
+                    st_na_global(recv_topk_weights + recv_idx, weight_value);
+
+                    local_expert_idx = static_cast<int>(idx_value);
+                    local_expert_prob = weight_value;
+
+                    if (unzipped_x != nullptr && local_expert_idx >= 0)
+                        slot = atomicAdd(unzipped_expert_counter + local_expert_idx, 1);
+                }
+
+                // Store data
                 mbarrier_wait(tma_mbarrier, tma_phase);
                 if (elect_one_sync()) {
                     tma_store_1d(tma_buffer, recv_x + recv_token_idx * hidden_int4, hidden_bytes, false);
@@ -1208,26 +1239,6 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 // Copy source meta
                 if (not kCachedMode and elect_one_sync())
                     st_na_global(recv_src_meta + recv_token_idx, meta);
-                shifted += sizeof(SourceMeta);
-
-                // Copy `topk_idx` and `topk_weights`
-                int local_expert_idx = -1;
-                float local_expert_prob = 0.0f;
-                if (lane_id < num_topk) {
-                    // Read
-                    auto idx_value = static_cast<topk_idx_t>(ld_nc_global(reinterpret_cast<int*>(shifted) + lane_id));
-                    auto weight_value = ld_nc_global(reinterpret_cast<float*>(shifted + sizeof(int) * num_topk) + lane_id);
-                    auto recv_idx = recv_token_idx * num_topk + lane_id;
-
-                    // Transform and write
-                    idx_value = (idx_value >= local_expert_begin and idx_value < local_expert_end) ? idx_value - local_expert_begin : -1;
-                    weight_value = idx_value >= 0 ? weight_value : 0.0f;
-                    st_na_global(recv_topk_idx + recv_idx, idx_value);
-                    st_na_global(recv_topk_weights + recv_idx, weight_value);
-
-                    local_expert_idx = static_cast<int>(idx_value);
-                    local_expert_prob = weight_value;
-                }
 
                 // Multicast the token into each of its local experts' region of `unzipped_x` (fused unzip)
                 if (unzipped_x != nullptr) {
@@ -1239,19 +1250,22 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                     auto expert_chunk_base = __shfl_sync(0xffffffff, cached_unzip_chunk_base, meta_lane);
 
                     // How many local experts this token hits
-                    auto num_hits = __popc(__ballot_sync(0xffffffff, local_expert_idx >= 0));
+                    auto bits = __ballot_sync(0xffffffff, local_expert_idx >= 0);
+                    auto num_hits = __popc(bits);
+                    auto hit_prefix = __popc(bits & ((1 << lane_id) - 1));
+
+                    if (stage_buffer_idx + num_hits > NUM_BATCH_RELEASE_TOKENS) {
+                        release_staged_tokens();
+                        stage_buffer_idx = 0;
+                    }
 
                     // Every hit lane issues its own copy
                     if (local_expert_idx >= 0) {
-                        auto slot = atomicAdd(unzipped_expert_counter + local_expert_idx * NUM_UNZIP_COUNTER_STRIDE, 1);
                         auto unzipped_idx = static_cast<int64_t>(expert_base) + slot;
 
                         tma_store_1d(tma_buffer, unzipped_x + unzipped_idx * hidden_int4, hidden_bytes, false);
 
-                        // FP8: the scales travel with the token, so multicast them the same way
-                        // NOTES: the aligned case reuses the scales already loaded into smem next to the
-                        // token; otherwise this lane copies them from the NVL buffer, which is still
-                        // valid because the channel head is only moved after the whole chunk is done
+                        // Multicast the scales in transposed layout
                         if (unzipped_scales != nullptr) {
                             if (scale_aligned) {
                                 for (int i = 0; i < num_scales; ++i)
@@ -1275,12 +1289,14 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                         // Stage the token release signal until this lane receives the next token
                         auto chunk_in_expert = slot / unzip_chunk_size;
                         auto chunk_begin = chunk_in_expert * unzip_chunk_size;
-                        staged_expert_idx = local_expert_idx;
-                        staged_chunk_offset = expert_base + chunk_begin;
-                        staged_chunk_size = min(unzip_chunk_size, expert_count - chunk_begin);
-                        staged_chunk_idx = expert_chunk_base + chunk_in_expert;
+                        auto i = stage_buffer_idx + hit_prefix;
+                        stage_buffer[i] = local_expert_idx;
+                        stage_buffer[i + NUM_BATCH_RELEASE_TOKENS] = expert_base + chunk_begin;
+                        stage_buffer[i + NUM_BATCH_RELEASE_TOKENS * 2] = min(unzip_chunk_size, expert_count - chunk_begin);
+                        stage_buffer[i + NUM_BATCH_RELEASE_TOKENS * 3] = expert_chunk_base + chunk_in_expert;
                     }
-                    __syncwarp();
+
+                    stage_buffer_idx += num_hits;
                 }
 
                 // Wait TMA to be finished
@@ -1288,8 +1304,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 __syncwarp();
             }
 
-            if (staged_chunk_idx != -1)
-                release_token();
+            release_staged_tokens();
 
             // Move queue
             if (elect_one_sync())
