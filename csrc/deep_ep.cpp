@@ -865,6 +865,9 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                                      num_ranks,
                                      comm_stream);
 
+    if (previous_event.has_value())
+        previous_event->event->record(comm_stream);
+
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
     void* bias_ptrs[2] = {nullptr, nullptr};
@@ -1560,6 +1563,9 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                              num_nvl_bytes,
                              false,
                              low_latency_mode);
+
+    if (previous_event.has_value())
+        previous_event->event->record(comm_stream);
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
