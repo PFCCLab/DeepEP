@@ -605,6 +605,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         // Copy rank prefix matrix and clean flags
         intranode::cached_notify_dispatch(
             rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
+
+        if (previous_event.has_value())
+            previous_event->event->record(comm_stream);
     } else {
         rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
         channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -864,6 +867,9 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                                      rank,
                                      num_ranks,
                                      comm_stream);
+
+    if (previous_event.has_value())
+        previous_event->event->record(comm_stream);
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
@@ -1130,6 +1136,9 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                  num_nvl_bytes,
                                  true,
                                  low_latency_mode);
+
+        if (previous_event.has_value())
+            previous_event->event->record(comm_stream);
     } else {
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -1560,6 +1569,9 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                              num_nvl_bytes,
                              false,
                              low_latency_mode);
+
+    if (previous_event.has_value())
+        previous_event->event->record(comm_stream);
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
