@@ -724,16 +724,18 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
             // Release the transaction in the window
             if (is_token_in_rank_uint64 != 0) {
+                // Wait the window to catch up, if the thread is ahead of the window
+                // NOTES: the spinlock used by `acquire_lock` doesn't guarantee fairness. The warp to update tail may
+                // starve if all warps are contending for the lock, resulting in livelock. To avoid this, only warps
+                // inside the window are allowed to acquire the lock
+                while (rdma_tail_idx - ld_acquire_cta(const_cast<const int*>(rdma_send_channel_tail + lane_id)) >= 32)
+                    ;
+
                 // Acquire lock first
                 acquire_lock(rdma_send_channel_lock + lane_id);
                 auto latest_tail = rdma_send_channel_tail[lane_id];
                 auto offset = rdma_tail_idx - latest_tail;
-                while (offset >= 32) {
-                    release_lock(rdma_send_channel_lock + lane_id);
-                    acquire_lock(rdma_send_channel_lock + lane_id);
-                    latest_tail = rdma_send_channel_tail[lane_id];
-                    offset = rdma_tail_idx - latest_tail;
-                }
+                EP_DEVICE_ASSERT(offset >= 0 and offset < 32);
 
                 // Release the transaction slot
                 // Add the bit and move the ones if possible
