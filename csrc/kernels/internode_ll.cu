@@ -126,7 +126,7 @@ void clean_low_latency_buffer(int* clean_0,
                   sync_buffer_ptr);
 }
 
-template <bool kUseFP8, bool kUseUE8M0, int kHidden>
+template <bool kUseFP8, bool kUseUE8M0, int kHidden, int kQuantGroupSize = 128>
 __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     void* packed_recv_x_scales,
                                                     int* packed_recv_src_info,
@@ -169,16 +169,20 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
     EP_STATIC_ASSERT(sizeof(packed_t) % sizeof(scale_t) == 0, "Invalid vector length");
 
+    // CUTLASS SfAtom layout for small group sizes with UE8M0
+    constexpr bool kUseCutlassSfLayout = kUseFP8 && kUseUE8M0 && (kQuantGroupSize != 128);
+
     // FP8 staffs
-    constexpr int kNumPerChannels = 128;
-    const int num_scales = kHidden / kNumPerChannels;
+    const int num_scales = kHidden / kQuantGroupSize;
     const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
     const size_t hidden_int4 = hidden_bytes / sizeof(int4);
 
     // Message package: index at source (int), 3 reserved int fields, hidden data, FP8 scales
     // NOTES: currently we have 3 reserved int fields for future use
+    // For UE8M0 with non-128 group size, pack scales as uint8 to reduce RDMA transfer
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
-    const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
+    constexpr size_t kScaleElemBytes = kUseCutlassSfLayout ? sizeof(uint8_t) : sizeof(float);
+    const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * kScaleElemBytes) : (kHidden * sizeof(nv_bfloat16)));
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
@@ -196,7 +200,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     if (warp_id < num_warps - 1) {
         constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
         EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");
-        EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
+        EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kQuantGroupSize == 0, "Invalid vectorization");
+        constexpr int kNumLanesPerGroup = kQuantGroupSize / kNumElemsPerRead;
         const auto num_threads = (num_warps - 1) * 32;
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
 
@@ -204,7 +209,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
             const auto x_int4 = static_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
             const auto rdma_x_src_idx = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_x) + token_idx * num_bytes_per_msg);
             const auto rdma_x_vec = reinterpret_cast<vec_t*>(reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4));
-            const auto rdma_x_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
+            const auto rdma_x_scales_area = reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes;
 
             // Overlap top-k index read and source token index writes
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
@@ -229,11 +234,17 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                     }
 
                     // Reduce amax and scale
-                    EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
-                    amax = warp_reduce_max<16>(amax);
+                    amax = warp_reduce_max<kNumLanesPerGroup>(amax);
                     calculate_fp8_scales(amax, scale, scale_inv, round_scale);
-                    if (lane_id == 0 or lane_id == 16)
-                        rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv;
+                    if (lane_id % kNumLanesPerGroup == 0) {
+                        const auto scale_idx = i * kNumElemsPerRead / kQuantGroupSize;
+                        if constexpr (kUseCutlassSfLayout) {
+                            // Pack as uint8 in RDMA message to reduce transfer size
+                            rdma_x_scales_area[scale_idx] = extract_required_scale_format<true>(scale_inv);
+                        } else {
+                            reinterpret_cast<float*>(rdma_x_scales_area)[scale_idx] = scale_inv;
+                        }
+                    }
 
                     // Cast into send buffer
                     vec_t int2_value;
@@ -371,8 +382,13 @@ LOW_LATENCY_DISPATCH_RECV:
         const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
         const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
         const auto num_aligned_scales = align_up<int>(num_scales, sizeof(float) / sizeof(scale_t));
+        // For CUTLASS SfAtom layout (kQuantGroupSize != 128 with UE8M0), pad token dim to 128
+        constexpr bool kUseCutlassSfLayout = (kQuantGroupSize != 128) && kUseUE8M0;
+        const auto scale_mn_dim = kUseCutlassSfLayout ?
+            ((num_ranks * num_max_dispatch_tokens_per_rank + 127) & ~127) :
+            num_ranks * num_max_dispatch_tokens_per_rank;
         const auto recv_x_scales = static_cast<scale_t*>(packed_recv_x_scales) +
-            local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_aligned_scales;
+            local_expert_idx * scale_mn_dim * num_aligned_scales;
 
         // Shared between sub-warps in warp groups
         __shared__ int shared_num_recv_tokens[kNumMaxWarpGroups], shared_recv_token_begin_idx[kNumMaxWarpGroups];
@@ -422,7 +438,6 @@ LOW_LATENCY_DISPATCH_RECV:
         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
 
         // Copy tokens
-        EP_DEVICE_ASSERT(num_scales <= 64);
         for (int i = sub_warp_id; i < num_recv_tokens; i += num_warps_per_group) {
             // Copy source info
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
@@ -438,24 +453,41 @@ LOW_LATENCY_DISPATCH_RECV:
 
             // Copy scales
             if constexpr (kUseFP8) {
-                // Equivalent CuTe layout:
-                //   (num_tokens, (num_packed, num_elems_per_pack)):(num_elems_per_pack, (num_tokens * num_elems_per_pack, 1))
-                const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
-                const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
                 const auto token_idx = recv_token_begin_idx + i;
-                const auto token_stride = num_elems_per_pack;
-                const auto pack_stride = num_ranks * num_max_dispatch_tokens_per_rank * num_elems_per_pack;
-                if (lane_id < num_scales) {
-                    const auto pack_idx = lane_id / num_elems_per_pack;
-                    const auto elem_idx = lane_id % num_elems_per_pack;
-                    auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id));
-                    recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
-                }
-                if (lane_id + 32 < num_scales) {
-                    const auto pack_idx = (lane_id + 32) / num_elems_per_pack;
-                    const auto elem_idx = (lane_id + 32) % num_elems_per_pack;
-                    auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id + 32));
-                    recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
+
+                if constexpr (kUseCutlassSfLayout) {
+                    // CUTLASS SfAtom interleaved layout with packed uint8 scales in message
+                    //   Atom shape: ((32, 4), (SFVecSize, 4)), stride: ((16, 4), (0, 1))
+                    //   Physical atom size: 128 MN x 4 K = 512 bytes
+                    const auto src_scales_u8 = reinterpret_cast<uint8_t*>(src_data) + hidden_bytes;
+                    const auto kb_dim = num_aligned_scales;
+                    const auto num_k_tiles = kb_dim / 4;
+                    const int n_tile = token_idx / 128;
+                    const int n_local = token_idx % 128;
+                    const int mn_i = n_local % 32;
+                    const int mn_j = n_local / 32;
+                    const int base_offset = n_tile * num_k_tiles * 512 + mn_i * 16 + mn_j * 4;
+                    // Vectorized: each lane handles one k_tile (4 uint8 scales)
+                    // Read 4 consecutive uint8 as uint32 from packed message, write 4 bytes at once
+                    #pragma unroll 1
+                    for (int k = lane_id; k < num_k_tiles; k += 32) {
+                        uint32_t packed = ld_nc_global(reinterpret_cast<const int*>(src_scales_u8 + k * 4));
+                        *reinterpret_cast<uint32_t*>(recv_x_scales + base_offset + k * 512) = packed;
+                    }
+                } else {
+                    // Original CuTe interleaved layout with float scales in message
+                    //   (num_tokens, (num_packed, num_elems_per_pack)):(num_elems_per_pack, (num_tokens * num_elems_per_pack, 1))
+                    const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
+                    const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
+                    const auto token_stride = num_elems_per_pack;
+                    const auto pack_stride = num_ranks * num_max_dispatch_tokens_per_rank * num_elems_per_pack;
+                    #pragma unroll 1
+                    for (int s = lane_id; s < num_scales; s += 32) {
+                        const auto pack_idx = s / num_elems_per_pack;
+                        const auto elem_idx = s % num_elems_per_pack;
+                        auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + s));
+                        recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
+                    }
                 }
             }
         }
@@ -487,6 +519,7 @@ void dispatch(void* packed_recv_x,
               bool use_fp8,
               bool round_scale,
               bool use_ue8m0,
+              int quant_group_size,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
@@ -509,44 +542,53 @@ void dispatch(void* packed_recv_x,
     // FP8 checks
     if (use_ue8m0)
         EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
+    if (use_fp8)
+        EP_HOST_ASSERT((quant_group_size == 128 or quant_group_size == 32 or quant_group_size == 16) and
+                       "quant_group_size must be 128, 32, or 16");
 
-#define DISPATCH_LAUNCH_CASE(hidden)                         \
-    {                                                        \
-        auto dispatch_func = dispatch<false, false, hidden>; \
-        if (use_fp8 and not use_ue8m0)                       \
-            dispatch_func = dispatch<true, false, hidden>;   \
-        if (use_fp8 and use_ue8m0)                           \
-            dispatch_func = dispatch<true, true, hidden>;    \
-        LAUNCH_KERNEL(&cfg,                                  \
-                      dispatch_func,                         \
-                      packed_recv_x,                         \
-                      packed_recv_x_scales,                  \
-                      packed_recv_src_info,                  \
-                      packed_recv_layout_range,              \
-                      packed_recv_count,                     \
-                      mask_buffer_ptr,                       \
-                      cumulative_local_expert_recv_stats,    \
-                      dispatch_wait_recv_cost_stats,         \
-                      rdma_recv_x,                           \
-                      rdma_recv_count,                       \
-                      rdma_x,                                \
-                      x,                                     \
-                      topk_idx,                              \
-                      atomic_counter_per_expert,             \
-                      atomic_finish_counter_per_expert,      \
-                      next_clean,                            \
-                      num_next_clean_int,                    \
-                      num_tokens,                            \
-                      num_max_dispatch_tokens_per_rank,      \
-                      num_topk,                              \
-                      num_experts,                           \
-                      rank,                                  \
-                      num_ranks,                             \
-                      num_warp_groups,                       \
-                      num_warps_per_group,                   \
-                      round_scale,                           \
-                      phases);                               \
-    }                                                        \
+#define DISPATCH_LAUNCH_CASE(hidden)                                                              \
+    {                                                                                             \
+        auto dispatch_func = dispatch<false, false, hidden, 128>;                                 \
+        if (use_fp8 and not use_ue8m0) {                                                          \
+            if (quant_group_size == 128) dispatch_func = dispatch<true, false, hidden, 128>;\
+            if (quant_group_size == 32)  dispatch_func = dispatch<true, false, hidden, 32>; \
+            if (quant_group_size == 16)  dispatch_func = dispatch<true, false, hidden, 16>; \
+        }                                                                                         \
+        if (use_fp8 and use_ue8m0) {                                                              \
+            if (quant_group_size == 128) dispatch_func = dispatch<true, true, hidden, 128>; \
+            if (quant_group_size == 32)  dispatch_func = dispatch<true, true, hidden, 32>;  \
+            if (quant_group_size == 16)  dispatch_func = dispatch<true, true, hidden, 16>;  \
+        }                                                                                         \
+        LAUNCH_KERNEL(&cfg,                                                                       \
+                      dispatch_func,                                                              \
+                      packed_recv_x,                                                              \
+                      packed_recv_x_scales,                                                       \
+                      packed_recv_src_info,                                                       \
+                      packed_recv_layout_range,                                                   \
+                      packed_recv_count,                                                          \
+                      mask_buffer_ptr,                                                            \
+                      cumulative_local_expert_recv_stats,                                         \
+                      dispatch_wait_recv_cost_stats,                                              \
+                      rdma_recv_x,                                                                \
+                      rdma_recv_count,                                                            \
+                      rdma_x,                                                                     \
+                      x,                                                                          \
+                      topk_idx,                                                                   \
+                      atomic_counter_per_expert,                                                  \
+                      atomic_finish_counter_per_expert,                                           \
+                      next_clean,                                                                 \
+                      num_next_clean_int,                                                         \
+                      num_tokens,                                                                 \
+                      num_max_dispatch_tokens_per_rank,                                           \
+                      num_topk,                                                                   \
+                      num_experts,                                                                \
+                      rank,                                                                       \
+                      num_ranks,                                                                  \
+                      num_warp_groups,                                                            \
+                      num_warps_per_group,                                                        \
+                      round_scale,                                                                \
+                      phases);                                                                    \
+    }                                                                                             \
     break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);

@@ -150,7 +150,7 @@ public:
 
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
 
-    torch::Stream get_comm_stream() const {
+    at::cuda::CUDAStream get_comm_stream() const {
         return comm_stream;
     }
     
@@ -177,6 +177,8 @@ public:
                torch::Tensor,
                torch::Tensor,
                torch::Tensor,
+               std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
                std::optional<EventHandle>>
     intranode_dispatch(const torch::Tensor& x,
                        const std::optional<torch::Tensor>& x_scales,
@@ -194,7 +196,10 @@ public:
                        std::optional<EventHandle>& previous_event,
                        bool async,
                        bool allocate_on_comm_stream,
-                       bool skip_x_record_stream = false);
+                       bool skip_x_record_stream = false,
+                       int quant_group_size = 128,
+                       bool use_mask_prmt = false,
+                       int max_tokens_per_expert = 0);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> intranode_combine(
         const torch::Tensor& x,
@@ -283,7 +288,8 @@ public:
                          bool round_scale,
                          bool use_ue8m0,
                          bool async,
-                         bool return_recv_hook);
+                         bool return_recv_hook,
+                         int quant_group_size = 128);
 
     std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::function<void()>>> low_latency_combine(
         const torch::Tensor& x,

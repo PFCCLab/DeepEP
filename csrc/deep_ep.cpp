@@ -151,7 +151,7 @@ Buffer::Buffer(int rank,
               place, phi::distributed::CommType::ALLTOALL);
           calc_ctx = reinterpret_cast<phi::GPUContext*>(
               reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)->GetDeviceContext(place, true));
-          return at::cuda::getStreamFromExternal(comm_ctx->GetStream(), device_id);
+          return at::cuda::CUDAStream(comm_ctx->GetStream());
       }()),
       shared_memory_allocator(use_fabric) {
     // Metadata memory
@@ -409,7 +409,7 @@ Buffer::get_dispatch_layout(
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    auto compute_stream = at::cuda::CUDAStream(calc_ctx->stream());
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() and async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -476,6 +476,8 @@ std::tuple<torch::Tensor,
            torch::Tensor,
            torch::Tensor,
            torch::Tensor,
+           std::optional<torch::Tensor>,
+           std::optional<torch::Tensor>,
            std::optional<EventHandle>>
 Buffer::intranode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& x_scales,
@@ -493,7 +495,10 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            std::optional<EventHandle>& previous_event,
                            bool async,
                            bool allocate_on_comm_stream,
-                           bool skip_x_record_stream) {
+                           bool skip_x_record_stream,
+                           int quant_group_size,
+                           bool use_mask_prmt,
+                           int max_tokens_per_expert) {
     bool cached_mode = cached_rank_prefix_matrix.has_value();
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
@@ -538,6 +543,15 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_experts = cached_mode ? 0 : static_cast<int>(num_tokens_per_expert->size(0)), num_local_experts = num_experts / num_ranks;
 
+    // use_mask_prmt checks
+    if (use_mask_prmt) {
+        EP_HOST_ASSERT(quant_group_size == 32);
+        EP_HOST_ASSERT(x_scales.has_value());
+        EP_HOST_ASSERT(topk_idx.has_value());
+        EP_HOST_ASSERT(max_tokens_per_expert > 0);
+        EP_HOST_ASSERT(num_local_experts > 0);
+    }
+
     // Top-k checks
     int num_topk = 0;
     topk_idx_t* topk_idx_ptr = nullptr;
@@ -556,22 +570,23 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     }
 
     // FP8 scales checks
-    float* x_scales_ptr = nullptr;
+    void* x_scales_ptr = nullptr;
     int num_scales = 0, scale_token_stride = 0, scale_hidden_stride = 0;
     if (x_scales.has_value()) {
         EP_HOST_ASSERT(x.element_size() == 1);
-        EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or x_scales->scalar_type() == torch::kInt);
+        EP_HOST_ASSERT(x_scales->scalar_type() == torch::kFloat32 or x_scales->scalar_type() == torch::kInt or
+                        x_scales->scalar_type() == torch::kByte);
         EP_HOST_ASSERT(x_scales->dim() == 2);
         EP_HOST_ASSERT(x_scales->size(0) == num_tokens);
         num_scales = x_scales->dim() == 1 ? 1 : static_cast<int>(x_scales->size(1));
-        x_scales_ptr = static_cast<float*>(x_scales->data_ptr());
+        x_scales_ptr = x_scales->data_ptr();
         scale_token_stride = static_cast<int>(x_scales->stride(0));
         scale_hidden_stride = static_cast<int>(x_scales->stride(1));
     }
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    auto compute_stream = at::cuda::CUDAStream(calc_ctx->stream());
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -664,17 +679,24 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
     }
 
     // Allocate new tensors
-    auto recv_x = torch::empty({num_recv_tokens, hidden}, x.options());
+    // When use_mask_prmt: recv_x is [E*M, hidden], recv_x_scales is [E, M, kb_dim] uint8 (SfAtom layout)
+    auto recv_x = use_mask_prmt
+                      ? torch::empty({num_local_experts * max_tokens_per_expert, hidden}, x.options())
+                      : torch::empty({num_recv_tokens, hidden}, x.options());
     auto recv_src_idx = torch::empty({num_recv_tokens}, dtype(torch::kInt32).device(torch::kCUDA));
     auto recv_topk_idx = std::optional<torch::Tensor>(), recv_topk_weights = std::optional<torch::Tensor>(),
          recv_x_scales = std::optional<torch::Tensor>();
     auto recv_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
     auto send_head = torch::empty({num_tokens, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
 
+    // Mask PMRT additional tensors
+    auto permuted_indice_map_tensor = std::optional<torch::Tensor>();
+    auto token_nums_per_expert_tensor = std::optional<torch::Tensor>();
+
     // Assign pointers
     topk_idx_t* recv_topk_idx_ptr = nullptr;
     float* recv_topk_weights_ptr = nullptr;
-    float* recv_x_scales_ptr = nullptr;
+    void* recv_x_scales_ptr = nullptr;
     if (topk_idx.has_value()) {
         recv_topk_idx = torch::empty({num_recv_tokens, num_topk}, topk_idx->options());
         recv_topk_weights = torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
@@ -682,12 +704,25 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
     }
     if (x_scales.has_value()) {
-        recv_x_scales = x_scales->dim() == 1 ? torch::empty({num_recv_tokens}, x_scales->options())
-                                             : torch::empty({num_recv_tokens, num_scales}, x_scales->options());
-        recv_x_scales_ptr = static_cast<float*>(recv_x_scales->data_ptr());
+        if (use_mask_prmt) {
+            // SfAtom layout: output_scale [E, M, kb_dim] as uint8
+            int hidden_scale = static_cast<int>(x_scales->size(1)) / 4;
+            int kb_dim_val = hidden_scale * 4;
+            recv_x_scales = torch::empty({num_local_experts, max_tokens_per_expert, kb_dim_val},
+                                          dtype(torch::kByte).device(torch::kCUDA));
+        } else {
+            recv_x_scales = x_scales->dim() == 1 ? torch::empty({num_recv_tokens}, x_scales->options())
+                                                 : torch::empty({num_recv_tokens, num_scales}, x_scales->options());
+        }
+        recv_x_scales_ptr = recv_x_scales->data_ptr();
+    }
+    if (use_mask_prmt) {
+        permuted_indice_map_tensor = torch::full({num_recv_tokens, num_topk}, -1, dtype(torch::kInt32).device(torch::kCUDA));
+        token_nums_per_expert_tensor = torch::zeros({num_local_experts}, dtype(torch::kInt32).device(torch::kCUDA));
     }
 
     // Dispatch
+    int scale_elem_size = (quant_group_size == 32) ? sizeof(uint8_t) : sizeof(float);
     EP_HOST_ASSERT(
         num_ranks * num_ranks * sizeof(int) +                                                                     // Size prefix matrix
             num_channels * num_ranks * sizeof(int) +                                                              // Channel start offset
@@ -697,8 +732,15 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(int) +                     // Source index buffer
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(topk_idx_t) +   // Top-k index buffer
             num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * num_topk * sizeof(float) +        // Top-k weight buffer
-            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * sizeof(float) * num_scales        // FP8 scale buffer
+            num_channels * num_ranks * config.num_max_nvl_chunked_recv_tokens * scale_elem_size * num_scales      // FP8 scale buffer
         <= num_nvl_bytes);
+    // Compute hidden_scale and kb_dim for mask_pmrt
+    int hidden_scale = 0, kb_dim = 0;
+    if (use_mask_prmt) {
+        hidden_scale = static_cast<int>(x_scales->size(1)) / 4;
+        kb_dim = hidden_scale * 4;
+    }
+
     intranode::dispatch(recv_x.data_ptr(),
                         recv_x_scales_ptr,
                         recv_src_idx.data_ptr<int>(),
@@ -726,7 +768,15 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                         comm_stream,
                         config.num_sms,
                         config.num_max_nvl_chunked_send_tokens,
-                        config.num_max_nvl_chunked_recv_tokens);
+                        config.num_max_nvl_chunked_recv_tokens,
+                        quant_group_size,
+                        use_mask_prmt,
+                        use_mask_prmt ? permuted_indice_map_tensor->data_ptr<int32_t>() : nullptr,
+                        use_mask_prmt ? token_nums_per_expert_tensor->data_ptr<int32_t>() : nullptr,
+                        max_tokens_per_expert,
+                        num_local_experts,
+                        hidden_scale,
+                        kb_dim);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -758,7 +808,9 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                          cached_rank_prefix_matrix,
                          recv_topk_idx,
                          recv_topk_weights,
-                         recv_x_scales}) {
+                         recv_x_scales,
+                         permuted_indice_map_tensor,
+                         token_nums_per_expert_tensor}) {
             to.has_value() ? to->record_stream(comm_stream) : void();
             if (allocate_on_comm_stream)
                 to.has_value() ? to->record_stream(compute_stream) : void();
@@ -783,6 +835,8 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
             recv_channel_prefix_matrix,
             recv_src_idx,
             send_head,
+            permuted_indice_map_tensor,
+            token_nums_per_expert_tensor,
             event};
 }
 
@@ -822,7 +876,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    auto compute_stream = at::cuda::CUDAStream(calc_ctx->stream());
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -1064,7 +1118,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    auto compute_stream = at::cuda::CUDAStream(calc_ctx->stream());
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -1382,7 +1436,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
-    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    auto compute_stream = at::cuda::CUDAStream(calc_ctx->stream());
     if (allocate_on_comm_stream) {
         EP_HOST_ASSERT(previous_event.has_value() && async);
         deep_ep::SetAllocatorStreamForGPUContext(comm_stream, calc_ctx);
@@ -1567,14 +1621,15 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
                              bool round_scale,
                              bool use_ue8m0,
                              bool async,
-                             bool return_recv_hook) {
+                             bool return_recv_hook,
+                             int quant_group_size) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
 
     // Tensor checks
     // By default using `ptp128c` FP8 cast
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
-    EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % 128 == 0);
+    EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % quant_group_size == 0);
     EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
     EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
@@ -1597,7 +1652,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     auto num_local_experts = num_experts / num_ranks;
 
     // Buffer control
-    LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
+    LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts, quant_group_size);
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
     auto buffer = layout.buffers[low_latency_buffer_idx];
     auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
@@ -1625,16 +1680,28 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
 
     if (use_fp8) {
         // TODO: support unaligned cases
-        EP_HOST_ASSERT(hidden % 512 == 0);
-        if (not use_ue8m0) {
-            packed_recv_x_scales = torch::empty({num_local_experts, hidden / 128, num_ranks * num_max_dispatch_tokens_per_rank},
+        EP_HOST_ASSERT(hidden % quant_group_size == 0);
+        const auto num_scales = hidden / quant_group_size;
+        const auto mn_dim = num_ranks * num_max_dispatch_tokens_per_rank;
+
+        if (quant_group_size != 128 and use_ue8m0) {
+            // CUTLASS SfAtom layout: pad token dim to 128-tile boundary, store as flat uint8
+            EP_HOST_ASSERT(round_scale);
+            EP_HOST_ASSERT(num_scales % 4 == 0 and "CUTLASS SfAtom requires num_scales to be multiple of 4");
+            const auto padded_mn = ((mn_dim + 127) / 128) * 128;
+            packed_recv_x_scales = torch::empty({num_local_experts, padded_mn, num_scales},
+                                                torch::dtype(torch::kByte).device(torch::kCUDA));
+            // No transpose - kernel writes directly in CUTLASS SfAtom order
+        } else if (not use_ue8m0) {
+            packed_recv_x_scales = torch::empty({num_local_experts, num_scales, mn_dim},
                                                 torch::dtype(torch::kFloat32).device(torch::kCUDA));
+            packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
         } else {
             EP_HOST_ASSERT(round_scale);
-            packed_recv_x_scales = torch::empty({num_local_experts, hidden / 512, num_ranks * num_max_dispatch_tokens_per_rank},
+            packed_recv_x_scales = torch::empty({num_local_experts, num_scales / 4, mn_dim},
                                                 torch::dtype(torch::kInt).device(torch::kCUDA));
+            packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
         }
-        packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
         packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
     }
 
@@ -1667,6 +1734,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             use_fp8,
             round_scale,
             use_ue8m0,
+            quant_group_size,
             workspace,
             num_device_sms,
             launch_stream.stream(),
@@ -1900,7 +1968,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_comm_stream",
            [](deep_ep::Buffer &self) {
              int device_id = self.get_local_device_id();
-                         cudaStream_t comm_stream = at::cuda::CUDAStream(self.get_comm_stream()).stream();
+             cudaStream_t comm_stream = self.get_comm_stream().stream();
              auto s = phi::Stream(reinterpret_cast<phi::StreamId>(comm_stream));
 #if defined(PADDLE_WITH_CUDA)
              return phi::CUDAStream(phi::GPUPlace(device_id), s);
