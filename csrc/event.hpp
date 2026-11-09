@@ -25,6 +25,8 @@ struct EventHandle {
     void current_stream_wait() const { at::cuda::getCurrentCUDAStream().unwrap().wait(*event); }
 
     bool query() const { return event->query(); }
+
+    void synchronize() const { event->synchronize(); }
 };
 
 torch::Event create_event(const at::cuda::CUDAStream& s) {

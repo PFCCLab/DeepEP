@@ -1217,7 +1217,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
                 // Store data
                 mbarrier_wait(tma_mbarrier, tma_phase);
-                if (elect_one_sync()) {
+                if (unzipped_x == nullptr and elect_one_sync()) {
                     tma_store_1d(tma_buffer, recv_x + recv_token_idx * hidden_int4, hidden_bytes, false);
                     if (scale_aligned)
                         tma_store_1d(tma_buffer + hidden_bytes, recv_x_scales + recv_token_idx * num_scales, scale_bytes, false);

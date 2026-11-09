@@ -43,8 +43,11 @@ class EventOverlap:
         """
         Check if the stream where this event was recorded already moved past the point where the event was recorded.
         """
-        assert self.event is not None
         return self.event.query()
+
+    def synchronize(self):
+        """Host waits for the event to finish."""
+        return self.event.synchronize()
 
     def calc_stream_wait(self, group_idx) -> None:
         self.event.calc_stream_wait(group_idx)
