@@ -13,6 +13,39 @@
 #include "jit/compiler.cuh"
 #include "extension/permute.cuh"
 #include "extension/allgather.cuh"
+#include "buffer/intranode.cuh"
+#ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
+#include "buffer/internode.cuh"
+#endif
+
+struct HandleImpl {
+    // Handle for dispatch
+    torch::Tensor sparse_to_dense_map;
+    torch::Tensor rdma_to_attn_map;
+    torch::Tensor attn_to_rdma_map;
+    torch::Tensor num_dispatched_tokens_tensor;
+    torch::Tensor local_expert_routing_map;
+    int64_t num_of_tokens_per_rank = -1;
+    // Number of real (valid) tokens on this rank. May be smaller than
+    // num_of_tokens_per_rank (the group-uniform token-slot count) when ranks
+    // dispatch unequal token counts; the trailing slots carry all-false /
+    // sentinel routing rows and never move data. -1 means "same as
+    // num_of_tokens_per_rank".
+    int64_t num_of_valid_tokens = -1;
+    HybridEpConfigInstance config;
+
+    int64_t valid_token_count() const {
+        return num_of_valid_tokens >= 0 ? num_of_valid_tokens : num_of_tokens_per_rank;
+    }
+
+    // Dense-layout metadata for permute/unpermute.
+    torch::Tensor tokens_per_expert; 
+    torch::Tensor padded_tokens_per_expert; 
+    torch::Tensor overflow_flag;
+    int64_t num_permuted_tokens = -1;
+    torch::Tensor dense_chunk_layout;
+    torch::Tensor dense_to_expert_map;
+};
 
 class Executor {
 public:
@@ -29,17 +62,26 @@ public:
         torch::Tensor sparse_to_dense_map;
         torch::Tensor rdma_to_attn_map;
         torch::Tensor attn_to_rdma_map;
-        c10::optional<torch::Tensor> num_dispatched_tokens_tensor;  // Used in the permute
-        c10::optional<torch::Tensor> local_expert_routing_map;      // Used in the permute
+        c10::optional<torch::Tensor> num_dispatched_tokens_tensor;
 
-        int64_t num_dispatched_tokens = -1;
-        // Used in the permute case, use up-bound to avoid synchronization to get the real num_dispatched_tokens from the pinned memory
-        int64_t max_num_dispatched_tokens = -1;
-        c10::optional<torch::Tensor> row_id_map;
+        // Output of permute
+        torch::Tensor local_expert_output_token;
+        c10::optional<torch::Tensor> local_expert_output_prob;
+        c10::optional<torch::Tensor> local_expert_output_scaling_factor;
+        // Used in the fused permute-dispatch
+        torch::Tensor dense_chunk_layout;           
+        torch::Tensor dense_to_expert_map; 
+        torch::Tensor tokens_per_expert; 
+
         int64_t num_permuted_tokens = -1;
+        // Caller-supplied dispatched token count. When >= 0 it is used verbatim to
+        // size the outputs instead of reading num_dispatched_tokens_tensor back on
+        // the host, which is what makes the no-permute path CUDA-graph capturable.
+        int64_t num_dispatched_tokens = -1;
         // Misc
         int pad_multiple;  // Used in the padding case of permute
         bool enable_permute = false;
+        bool fuse_permute_dispatch = false;
         bool non_blocking = false;  // If enable this, the produced num_dispatched_tokens will be put
                                         // on the CPU pinned memory, and the tokens_per_expert will be put
                                         // on the CPU, which may reduce the times of the sync
@@ -58,14 +100,15 @@ public:
         torch::Tensor sparse_to_dense_map;
         torch::Tensor rdma_to_attn_map;
         torch::Tensor attn_to_rdma_map;
-        c10::optional<torch::Tensor> num_dispatched_tokens_tensor;
-        // Output of Permute-preprocess
-        c10::optional<torch::Tensor> row_id_map;  // Used in the unpermute
-        // Used in the sync-free Unpermute
-        int64_t num_dispatched_tokens = -1;
+        // Dense-layout metadata used by standalone and fused unpermute.
+        torch::Tensor dense_chunk_layout;  
+        torch::Tensor dense_to_expert_map;          
+        torch::Tensor tokens_per_expert;            
+        
         // Misc
-        int pad_multiple;  // Used in the padding case of unpermute
         bool enable_unpermute = false;
+        bool fuse_unpermute_combine = false;
+        bool non_blocking = false; // If enable this, the HYBRID_EP_BUILD_TOKEN_DROP_ENABLE will be enabled on the fused combine-unpermute kernel.
         int64_t num_of_tokens_per_rank;  // Dynamic sequence length
         cudaStream_t stream;
     };
@@ -77,36 +120,52 @@ public:
         py::object process_group
     );
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-    metadata_preprocess_core(
+    HandleImpl metadata_preprocess_core(
         HybridEpConfigInstance config,
         hybrid_ep::tmp_state_t *preprocessing_tmp,
+        hybrid_ep::tmp_state_t *preprocessing_local_experts_tmp,
         torch::Tensor global_routing_map,
-        int num_of_tokens_per_rank,
+        int64_t num_of_tokens_per_rank,
+        int64_t num_of_valid_tokens,
+        int64_t num_permuted_tokens,
+        int64_t pad_multiple,
+        bool enable_permute,
+        bool fuse_unpermute_combine,
         bool non_blocking
     );
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> 
-    dispatch_preprocess(
-        HybridEpConfigInstance config, DispatchBuffers& dispatch_buffers, DispatchArgs& args);
+    void dispatch_preprocess(
+        HybridEpConfigInstance config, DispatchArgs& args);
     template<typename DType> 
     void dispatch_core(
-        HybridEpConfigInstance config, DispatchBuffers& dispatch_buffers, DispatchArgs& args);
-    std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor> > 
-    dispatch_postprocess(
-        HybridEpConfigInstance config, DispatchBuffers& dispatch_buffers, DispatchArgs& args); 
+        HybridEpConfigInstance config, DispatchArgs& args);
+    void dispatch_postprocess(
+        HybridEpConfigInstance config, DispatchArgs& args); 
 
     void combine_preprocess(
-        HybridEpConfigInstance config, CombineBuffers& combine_buffers, CombineArgs& args);
+        HybridEpConfigInstance config, CombineArgs& args);
     void combine_core(
-        HybridEpConfigInstance config, CombineBuffers& combine_buffers, CombineArgs& args);
+        HybridEpConfigInstance config, CombineArgs& args);
     void combine_postprocess(
-        HybridEpConfigInstance config, CombineBuffers& combine_buffers, CombineArgs& args); 
+        HybridEpConfigInstance config, CombineArgs& args); 
+
+    void set_intra_node_buffers(IntraNodeDispatchBuffers *intra_node_dispatch_buffers, IntraNodeCombineBuffers *intra_node_combine_buffers);
+#ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
+    void set_inter_node_buffers(InterNodeDispatchBuffers *inter_node_dispatch_buffers, InterNodeCombineBuffers *inter_node_combine_buffers);
+#endif
 
 private:
     KernelCache kernel_cache;
-    HybridEpConfigInstance config;
     int local_rank;
     int node_rank;
     bool enable_custom_allgather;
+
+    // Buffers for intra-node communication
+    IntraNodeDispatchBuffers *intra_node_dispatch_buffers = nullptr;
+    IntraNodeCombineBuffers *intra_node_combine_buffers = nullptr;
+#ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
+    // Buffers for inter-node communication
+    InterNodeDispatchBuffers *inter_node_dispatch_buffers = nullptr;
+    InterNodeCombineBuffers *inter_node_combine_buffers = nullptr;
+#endif
 };

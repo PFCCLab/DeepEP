@@ -14,6 +14,10 @@ from .runtime_paths import configure_runtime_paths, detect_runtime_paths
 configure_runtime_paths()
 import hybrid_ep_cpp
 
+INT16_EXPERT_LIMIT = torch.iinfo(torch.int16).max + 1
+DENSE_ROUTING_EXPERTS_PER_RANK_LIMIT = 512
+DENSE_ROUTING_RANKS_PER_NODE_LIMIT = 512
+
 def indices_to_map(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -25,25 +29,40 @@ def indices_to_map(
     """
     # Generate the routing map and the probs according to the topk_idx and topk_weights.
     assert topk_idx is not None
-    topk_idx = topk_idx.to(torch.int64)
-    routing_map = torch.zeros(
-        num_of_tokens, num_of_experts, device="cuda", dtype=torch.uint8
-    )
-    routing_map = paddle.put_along_axis(
-        routing_map,
-        topk_idx,
-        torch.ones(topk_idx.shape, device="cuda", dtype=torch.uint8),
-        axis=1,
-    ).bool()
+    valid = (topk_idx >= 0) & (topk_idx < num_of_experts)
+    safe_idx = torch.where(valid, topk_idx, torch.zeros_like(topk_idx)).to(torch.int64)
 
+    routing_counts = torch.zeros(
+        num_of_tokens, num_of_experts, device=topk_idx.device, dtype=torch.int32
+    )
+    routing_counts.scatter_add_(1, safe_idx, valid.to(torch.int32))
+    routing_map = routing_counts.bool()
     if topk_weights is not None:
         probs = torch.zeros(
-            num_of_tokens, num_of_experts, device="cuda", dtype=torch.float32
+            num_of_tokens, num_of_experts, device=topk_idx.device, dtype=torch.float32
         )
-        probs = paddle.put_along_axis(probs, topk_idx, topk_weights, axis=1)
+        safe_weights = torch.where(valid, topk_weights, torch.zeros_like(topk_weights)).to(probs.dtype)
+        probs.scatter_add_(1, safe_idx, safe_weights)
     else:
         probs = None
     return routing_map, probs
+
+
+def dense_indices_to_probs(
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_of_tokens: int,
+    num_of_experts: int,
+):
+    probs = torch.zeros(
+        num_of_tokens, num_of_experts, device=topk_idx.device, dtype=torch.float32
+    )
+    # Valid top-k routing has distinct expert IDs per token. Duplicate IDs are malformed input.
+    valid = (topk_idx >= 0) & (topk_idx < num_of_experts)
+    safe_idx = torch.where(valid, topk_idx, torch.zeros_like(topk_idx)).long()
+    safe_weights = torch.where(valid, topk_weights, torch.zeros_like(topk_weights)).to(probs.dtype)
+    probs.scatter_add_(1, safe_idx, safe_weights)
+    return probs
 
 
 def _nvtx_range(message: str):
@@ -67,6 +86,8 @@ class HybridEPBuffer:
         num_sms_dispatch_api: int = None,
         num_sms_combine_api: int = None,
         num_sms_preprocessing_api: int = None,
+        num_blocks_permute: int = None,
+        num_blocks_unpermute: int = None,
         # Experimental features
         load_cached_kernels: bool = False,  
         use_shared_buffer: bool = True,
@@ -117,74 +138,39 @@ class HybridEPBuffer:
         self.node_rank = self.rank // self.num_of_hybrid_ep_ranks_per_nvlink_domain
         # The number of nodes.
         self.num_of_nodes = self.group_size // self.num_of_hybrid_ep_ranks_per_nvlink_domain
-        self.use_fp8 = use_fp8
+        # Create Configurer: auto-detects SM count, applies SM defaults, fills and validates BufferConfig.
+        self.configurer = hybrid_ep_cpp.Configurer(
+            hidden_dim=hidden_dim,
+            max_num_of_tokens_per_rank=max_num_of_tokens_per_rank,
+            num_local_experts=num_local_experts,
+            num_of_ranks_per_node=self.num_of_hybrid_ep_ranks_per_nvlink_domain,
+            num_of_nodes=self.num_of_nodes,
+            use_fp8=use_fp8,
+            num_sms_dispatch_api=num_sms_dispatch_api,
+            num_sms_combine_api=num_sms_combine_api,
+            num_sms_preprocessing_api=num_sms_preprocessing_api,
+            num_blocks_permute=num_blocks_permute,
+            num_blocks_unpermute=num_blocks_unpermute,
+        )
 
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        sm_count = props.multi_processor_count
-        if num_sms_preprocessing_api is None:
-            num_sms_preprocessing_api = 108
-        num_blocks_permute_api = sm_count * 16
-        # Inter-node case should use less SMs for the dispatch and combine APIs.
-        if num_sms_dispatch_api is None:
-            num_sms_dispatch_api = 32 if self.num_of_nodes == 1 else 8
-        if num_sms_combine_api is None:
-            num_sms_combine_api = 32 if self.num_of_nodes == 1 else 8
-        assert (
-            sm_count >= num_sms_preprocessing_api
-            and sm_count >= num_sms_dispatch_api
-            and sm_count >= num_sms_combine_api
-        ), "check the sms occupancy setting"
-        # Used SMs for preprocessing of dispatch and permute.
-        self.num_sms_preprocessing_api = num_sms_preprocessing_api
-        self.num_sms_dispatch_api = num_sms_dispatch_api
-        self.num_sms_combine_api = num_sms_combine_api
-        self.num_blocks_permute_api = num_blocks_permute_api
-        
-        # Initialize the BufferConfig for the hybrid-ep buffer allocation.
-        self.config = hybrid_ep_cpp.BufferConfig()
-        self.config.hidden_dim = hidden_dim
-        self.config.max_num_of_tokens_per_rank = max(max_num_of_tokens_per_rank, 512)
-        self.config.num_of_experts_per_rank = num_local_experts
-        self.config.num_of_ranks_per_node = self.num_of_hybrid_ep_ranks_per_nvlink_domain
-        self.config.num_of_nodes = self.num_of_nodes
-        self.config.num_of_blocks_dispatch_api = self.num_sms_dispatch_api
-        self.config.num_of_blocks_combine_api = self.num_sms_combine_api
-        # The SMs of preprocessing, chunk size of dispatch and combine will affact the size of intermediate buffers.
-        self.config.num_of_blocks_preprocessing_api = self.num_sms_preprocessing_api
-        self.config.num_of_blocks_permute_api = self.num_blocks_permute_api
-        # The fp8/bf16/fp16 data is communicated in the uint8/uint16 format.
-        self.config.token_data_type = (
-            hybrid_ep_cpp.UINT8 if self.use_fp8 else hybrid_ep_cpp.UINT16
-        )
-        self.config.num_of_tokens_per_chunk_dispatch_api = int(
-            os.getenv("NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API", "128")
-        )
-        self.config.num_of_tokens_per_chunk_combine_api = int(
-            os.getenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
-        )
-        # assert self.config.is_valid(), "The buffer config is not valid."
-        if not self.config.is_valid():
-            print(f"The buffer config is not valid. hidden_dim={hidden_dim}, max_num_of_tokens_per_rank={max_num_of_tokens_per_rank}, num_local_experts={num_local_experts}, self.config.num_of_ranks_per_node={self.config.num_of_ranks_per_node}, self.config.num_of_nodes={self.config.num_of_nodes}, use_fp8={use_fp8}")
-            raise ValueError("The buffer config is not valid.")
-      
         runtime_paths = detect_runtime_paths()
         # Create C++ buffer - this will allocate all buffers during construction
         self.runtime = hybrid_ep_cpp.HybridEPBuffer(
             self.group,
-            self.config,
+            self.configurer.buffer_config,
             self.local_rank,
             self.node_rank,
             self.group_size,
             os.path.dirname(os.path.abspath(__file__)),
-            load_cached_kernels = load_cached_kernels,   # whether to load the cached kernels in disk
-            use_shared_buffer = use_shared_buffer,      # whether to use the shared buffer for dispatch and combine
-            # Disable custom allgather by default because its data layout is incompatible with scan kernel
-            # The custom allgather kernel produces token-interleaved layout, but scan kernel expects
-            # the standard allgather layout (rank-blocked layout)
-            enable_custom_allgather = False,  # Always use standard allgather for correctness
-            cuda_home = runtime_paths.cuda_home or "",
-            rdma_include_dir = runtime_paths.rdma_include_dir or "",
-            rdma_library_dir = runtime_paths.rdma_library_dir or "",
+            load_cached_kernels=load_cached_kernels,
+            use_shared_buffer=use_shared_buffer,
+            # NOTE: the custom allgather kernel produces a token-interleaved layout, while the
+            # scan kernel expects the standard rank-blocked allgather layout, so it stays off
+            # unless the caller explicitly opts in.
+            enable_custom_allgather=enable_custom_allgather,
+            cuda_home=runtime_paths.cuda_home or "",
+            rdma_include_dir=runtime_paths.rdma_include_dir or "",
+            rdma_library_dir=runtime_paths.rdma_library_dir or "",
         )
 
     def empty_jit_cache(self):
@@ -195,94 +181,197 @@ class HybridEPBuffer:
         if os.path.exists(jit_cache_path):
             shutil.rmtree(jit_cache_path)
 
+    def _expected_num_of_experts(self, num_of_experts_per_rank: int = None):
+        if num_of_experts_per_rank is None:
+            num_of_experts_per_rank = self.configurer.buffer_config.num_of_experts_per_rank
+        num_of_experts_per_rank = int(num_of_experts_per_rank)
+        return (
+            num_of_experts_per_rank,
+            num_of_experts_per_rank
+            * self.num_of_hybrid_ep_ranks_per_nvlink_domain
+            * self.num_of_nodes,
+        )
+
+    def _use_dense_topk_routing(self, num_of_experts: int, num_of_experts_per_rank: int):
+        return (
+            num_of_experts <= INT16_EXPERT_LIMIT
+            and num_of_experts_per_rank <= DENSE_ROUTING_EXPERTS_PER_RANK_LIMIT
+            and self.num_of_hybrid_ep_ranks_per_nvlink_domain <= DENSE_ROUTING_RANKS_PER_NODE_LIMIT
+        )
+
+    @staticmethod
+    def _resolve_token_slots(num_of_tokens_per_rank, num_of_valid_tokens: int):
+        """
+        Resolve the group-uniform token-slot count for a dispatch call.
+
+        `num_of_tokens_per_rank` is the caller-provided slot count (identical on
+        every rank of the group; typically the group-wide max of the per-rank
+        token counts). Each rank's own tensors may hold fewer real rows
+        (`num_of_valid_tokens`). When omitted, it defaults to the local count,
+        which requires every rank to dispatch the same number of tokens.
+
+        The slot count is rounded up to a multiple of 16 so the TMA alignment
+        constraint on the remainder chunk holds for any ranks-per-node value,
+        and clamped to at least 16 so a group-wide-empty step (every rank has
+        zero tokens, hence a group max of 0) still dispatches cleanly; the
+        extra slots carry inert (routed-nowhere) routing rows.
+        """
+        if num_of_tokens_per_rank is None:
+            num_of_tokens_per_rank = num_of_valid_tokens
+        num_of_tokens_per_rank = int(num_of_tokens_per_rank)
+        assert num_of_tokens_per_rank >= num_of_valid_tokens, (
+            f"num_of_tokens_per_rank ({num_of_tokens_per_rank}) must be >= the local "
+            f"token count ({num_of_valid_tokens})"
+        )
+        num_of_tokens_per_rank = max(num_of_tokens_per_rank, 16)
+        return (num_of_tokens_per_rank + 15) // 16 * 16
+
+    def _check_handle_buffer_compat(self, handle_impl):
+        """
+        Cached handles are only valid against the buffer incarnation they were
+        created with: any reallocation (growth of the token capacity, hidden
+        dim, expert count, a chunk-size change, ...) resets completion flags
+        and re-registers the communication buffers, so replaying an older
+        handle would silently corrupt data or deadlock the flag protocol.
+        Every reallocation bumps the runtime's buffer generation; fail loudly
+        on mismatch.
+        """
+        if handle_impl.config.buffer_generation != self.runtime.buffer_generation:
+            raise RuntimeError(
+                f"This handle was created against buffer generation "
+                f"{handle_impl.config.buffer_generation}, but the buffers have since been "
+                f"reallocated (current generation {self.runtime.buffer_generation}). "
+                "Buffer reallocation invalidates cached handles; redo the dispatch "
+                "without a handle."
+            )
+
+    @staticmethod
+    def _pad_routing_rows(routing_data: torch.Tensor, topk: int, num_of_token_slots: int):
+        """
+        Pad routing data with routed-nowhere rows up to the group-uniform slot
+        count. Pad rows are all-False in sparse (bool map) mode and all -1 (the
+        dropped-token sentinel) in dense int16 top-k mode, so they produce no
+        dispatch entries, no wire traffic, and no expert GEMM rows.
+        """
+        pad = num_of_token_slots - routing_data.size(0)
+        if pad == 0:
+            return routing_data
+        assert pad > 0
+        if topk > 0:
+            filler = torch.full(
+                (pad, routing_data.size(1)), -1,
+                device=routing_data.device, dtype=routing_data.dtype,
+            )
+        else:
+            filler = torch.zeros(
+                (pad, routing_data.size(1)),
+                device=routing_data.device, dtype=routing_data.dtype,
+            )
+        return torch.cat([routing_data, filler])
+
+    def _prepare_routing_data(
+        self,
+        *,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_of_tokens: int,
+        num_of_experts: int,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        num_of_experts_per_rank: int = None,
+    ):
+        if routing_map is not None:
+            assert routing_map.dtype == torch.bool
+            num_of_experts = routing_map.size(-1)
+            if probs is not None:
+                assert probs.size(0) == num_of_tokens and probs.size(-1) == num_of_experts
+            return 0, routing_map, probs, num_of_experts
+
+        if topk_idx is None:
+            return 0, None, probs, num_of_experts
+
+        assert num_of_experts is not None, "num_of_experts is required with topk_idx"
+        num_of_experts_per_rank, expected_num_of_experts = self._expected_num_of_experts(
+            num_of_experts_per_rank
+        )
+        assert num_of_experts == expected_num_of_experts, (
+            f"num_of_experts ({num_of_experts}) must match the HybridEP layout "
+            f"({expected_num_of_experts})"
+        )
+        if probs is not None:
+            assert probs.size(0) == num_of_tokens and probs.size(-1) == num_of_experts
+
+        topk = topk_idx.size(-1)
+        if self._use_dense_topk_routing(num_of_experts, num_of_experts_per_rank):
+            # Dense mode stores signed int16 global expert IDs. Valid IDs are
+            # [0, num_of_experts); -1 is the dropped-token sentinel.
+            routing_data = topk_idx.to(torch.int16).contiguous()
+            if probs is None and topk_weights is not None:
+                probs = dense_indices_to_probs(
+                    topk_idx, topk_weights, num_of_tokens, num_of_experts
+                )
+            return topk, routing_data, probs, num_of_experts
+
+        # Preserve the pre-dense topk_idx behavior for layouts outside dense kernel limits.
+        routing_data, inferred_probs = indices_to_map(
+            topk_idx,
+            topk_weights if probs is None else None,
+            num_of_tokens,
+            num_of_experts,
+        )
+        if probs is None:
+            probs = inferred_probs
+        return 0, routing_data, probs, num_of_experts
+
     def update_template_config(
         self,
         hidden_dim: int = None,
         num_of_tokens_per_rank: int = None,
         num_local_experts: int = None,
+        pad_multiple: int = None,
         use_fp8: bool = None,
+        fuse_permute_dispatch: bool = False,
+        **kwargs,
     ):
         """
         Initialize the HybridEpConfigInstance which used to control the detailed setting of the hybrid-ep kernel.
         In common case, no need to change the default setting.
         """
-        config = hybrid_ep_cpp.HybridEpConfigInstance()
+        # Get a config with all env-var defaults and buffer-level state filled in.
+        config = self.configurer.get_default_config(fuse_permute_dispatch)
 
-        # Initialize the ConfigInstance
-        # Hybrid-ep Config
-        config.hidden_dim = (
-            hidden_dim if hidden_dim is not None else self.config.hidden_dim
-        )
-        if num_of_tokens_per_rank is None:
-            num_of_tokens_per_rank = self.config.max_num_of_tokens_per_rank
-        config.max_num_of_tokens_per_rank = max(
-            num_of_tokens_per_rank, self.config.max_num_of_tokens_per_rank
-        )
-        self.config.max_num_of_tokens_per_rank = config.max_num_of_tokens_per_rank
-        
-        config.num_of_experts_per_rank = (
-            num_local_experts
-            if num_local_experts is not None
-            else self.config.num_of_experts_per_rank
-        )
-        config.num_of_ranks_per_node = self.num_of_hybrid_ep_ranks_per_nvlink_domain
-        config.num_of_nodes = self.num_of_nodes
-
-        # Metadata-preprocessing API Config
-        config.num_of_blocks_preprocessing_api = self.num_sms_preprocessing_api
-        config.num_of_threads_per_block_preprocessing_api = int(
-            os.getenv("NUM_OF_THREADS_PER_BLOCK_PREPROCESSING_API", "512")
-        )
-        config.num_of_blocks_permute_api = self.num_blocks_permute_api
-
-        # Dispatch API Config
-        if use_fp8 is None:
-            use_fp8 = self.use_fp8
-        config.token_data_type = (
-            hybrid_ep_cpp.UINT8 if use_fp8 else hybrid_ep_cpp.UINT16
-        )
-        config.num_of_blocks_dispatch_api = self.num_sms_dispatch_api
-        config.device_side_sync_dispatch_api = True
-        # Dispatch stages config:
-        config.num_of_stages_dispatch_api = int(
-            os.getenv("NUM_OF_STAGES_DISPATCH_API", "10")
-        )
-        config.num_of_in_flight_s2g_dispatch_api = int(
-            os.getenv("NUM_OF_IN_FLIGHT_S2G_DISPATCH_API", "8")
-        )
-        config.num_of_tokens_per_chunk_dispatch_api = int(
-            os.getenv("NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API", "128")
-        )
-
-        # Combine API Config
-        config.num_of_blocks_combine_api = self.num_sms_combine_api
-        config.device_side_sync_combine_api = True
-        # Combine stages config:
-        if self.config.num_of_nodes > 1:
-            config.num_of_stages_g2s_combine_api = int(
-                os.getenv("NUM_OF_STAGES_G2S_COMBINE_API", "5")
+        # Per-call dynamic overrides
+        if hidden_dim is not None:
+            config.hidden_dim = hidden_dim
+        if num_of_tokens_per_rank is not None:
+            # Align num_of_tokens_per_rank up to the nearest multiple of 16.
+            num_of_tokens_per_rank = (num_of_tokens_per_rank + 15) // 16 * 16
+            config.max_num_of_tokens_per_rank = max(
+                num_of_tokens_per_rank,
+                self.configurer.buffer_config.max_num_of_tokens_per_rank,
             )
-        else:
-            config.num_of_stages_g2s_combine_api = int(
-                os.getenv("NUM_OF_STAGES_G2S_COMBINE_API", "10")
+            self.configurer.buffer_config.max_num_of_tokens_per_rank = config.max_num_of_tokens_per_rank
+        if num_local_experts is not None:
+            config.num_of_experts_per_rank = num_local_experts
+        if pad_multiple is not None and pad_multiple > 0:
+            config.pad_multiple = pad_multiple
+        if use_fp8 is not None:
+            config.token_data_type = (
+                hybrid_ep_cpp.UINT8 if use_fp8 else hybrid_ep_cpp.UINT16
             )
-        config.num_of_stages_s2g_combine_api = int(
-            os.getenv("NUM_OF_STAGES_S2G_COMBINE_API", "2")
-        )
-        config.num_of_tokens_per_chunk_combine_api = int(
-            os.getenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", "128")
-        )
-        config.num_of_tokens_per_group_combine_api = int(
-            os.getenv("NUM_OF_TOKENS_PER_GROUP_COMBINE_API", "4")
-        )
-        config.num_of_additional_in_flight_s2g_combine_api = int(
-            os.getenv("NUM_OF_ADDITIONAL_IN_FLIGHT_S2G_COMBINE_API", "2")
-        )
 
-        assert config.is_valid(), "The config is not valid."
+        # Update the config with the kwargs.
+        for key, value in kwargs.items():
+            setattr(config, key, value)
+        # Auto-tune stages based on current device shared memory limit.
+        self.configurer.adjust_template(config, fuse_permute_dispatch)
+        assert config.is_valid(fuse_permute_dispatch), "The config is not valid."
 
         # Use the runtime kernel config to update the buffer.
         self.runtime.update_buffer(config)
+        # Stamp the buffer incarnation this config (and any handle carrying it)
+        # belongs to, so stale-handle replay after a reallocation is rejected.
+        config.buffer_generation = self.runtime.buffer_generation
         return config
 
     def dispatch(
@@ -297,6 +386,7 @@ class HybridEPBuffer:
         num_dispatched_tokens_tensor: torch.Tensor = None,
         num_dispatched_tokens: int = None,
         handle: tuple = None,
+        num_of_tokens_per_rank: int = None,
     ):
         """
         Dispatch the data to the experts.
@@ -306,82 +396,96 @@ class HybridEPBuffer:
 
         Backward direction:
         combine_in_backward <- local_unpermute -> expert_mlp -> local_permute -> dispatch_in_backward
+
+        When routing_map is omitted, topk_idx is passed directly as int16 when dense routing
+        limits allow it (skipping indices_to_map), otherwise it falls back to the sparse map.
+        This reduces allgather size from T*E_total to T*K*2 bytes.
+        If both routing_map and topk_idx are provided, routing_map takes precedence.
+        Dropped tokens should use -1 as sentinel (naturally ignored by range checks in the kernel).
+
+        Ranks may dispatch unequal token counts: pass `num_of_tokens_per_rank`
+        as a group-uniform token-slot count (identical on every rank, e.g. the
+        group-wide max of the local counts, any value >= hidden.size(0)). The
+        routing data is padded internally with routed-nowhere rows, which cost
+        no communication and no expert compute; `combine` returns exactly
+        hidden.size(0) rows. When omitted, it defaults to hidden.size(0) and
+        all ranks must dispatch the same count (the previous behavior).
         """
         num_of_tokens, hidden_dim = hidden.shape
 
-        if routing_map is not None:
-            assert routing_map.dtype == torch.bool
-            num_of_experts = routing_map.size(-1)
-        else:
-            # Generate the routing map and the probs according to the topk_idx and topk_weights.
-            assert (
-                num_of_experts is not None
-            ), "The number of experts should be provided on index-based routing."
-            if topk_idx is not None:
-                routing_map, probs = indices_to_map(
-                    topk_idx, topk_weights, num_of_tokens, num_of_experts
-                )
+        topk, routing_data, probs, _ = self._prepare_routing_data(
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_of_tokens=num_of_tokens,
+            num_of_experts=num_of_experts,
+            probs=probs,
+            routing_map=routing_map,
+        )
 
         assert (
-            handle is not None or routing_map is not None
-        ), "The handle and routing_map should be both None"
-        # If the handle is not provided, we need to generate the handle using the preprocessing kernel.
+            handle is not None or routing_data is not None
+        ), "The handle and routing_map should not be both None"
         if handle is None:
+            assert routing_data.size(0) == num_of_tokens, (
+                f"The hidden ({num_of_tokens} rows) and the routing data "
+                f"({routing_data.size(0)} rows) should have the same row number."
+            )
+            num_of_token_slots = self._resolve_token_slots(num_of_tokens_per_rank, num_of_tokens)
+            routing_data = self._pad_routing_rows(routing_data, topk, num_of_token_slots)
             config = self.update_template_config(
                 hidden_dim=hidden_dim,
-                num_of_tokens_per_rank=num_of_tokens,
+                num_of_tokens_per_rank=num_of_token_slots,
+                topk=topk,
             )
-            # Run the metadata preprocessing kernel.
-            (
-                sparse_to_dense_map,
-                rdma_to_attn_map,
-                attn_to_rdma_map,
-                num_dispatched_tokens_tensor,
-                local_expert_routing_map,
-            ) = self.runtime.metadata_preprocessing(
+            handle_impl = self.runtime.metadata_preprocessing(
                 config=config,
-                routing_map=routing_map,
-                num_of_tokens_per_rank=num_of_tokens,
-            )
-            # Create the handle using the data generated by the preprocessing kernel.
-            handle = (
-                sparse_to_dense_map,
-                rdma_to_attn_map,
-                attn_to_rdma_map,
-                num_dispatched_tokens_tensor,
-                local_expert_routing_map,
-                num_of_tokens,
-                config,
+                routing_map=routing_data,
+                num_of_tokens_per_rank=num_of_token_slots,
+                num_of_valid_tokens=num_of_tokens,
+                enable_permute=False,
+                non_blocking=False,
             )
         else:
+            handle_impl = hybrid_ep_cpp.HandleImpl()
             (
-                sparse_to_dense_map,
-                rdma_to_attn_map,
-                attn_to_rdma_map,
-                num_dispatched_tokens_tensor,
-                local_expert_routing_map,
-                num_of_tokens,
-                config,
+                handle_impl.sparse_to_dense_map,
+                handle_impl.rdma_to_attn_map,
+                handle_impl.attn_to_rdma_map,
+                handle_impl.num_dispatched_tokens_tensor,
+                handle_impl.local_expert_routing_map,
+                handle_impl.num_of_tokens_per_rank,
+                handle_impl.config,
+                handle_impl.num_of_valid_tokens,
             ) = handle
+            self._check_handle_buffer_compat(handle_impl)
+            if handle_impl.num_of_valid_tokens != num_of_tokens:
+                warnings.warn(
+                    "The handle was built for a different local token count; it could be invalid."
+                )
 
         if num_dispatched_tokens is None:
+            # The executor reads the count back on the host to size the outputs, so
+            # the pinned buffer has to hold a real value first. While a graph is being
+            # captured the kernel that fills it is only recorded, never run, so there
+            # is nothing to wait for and the caller has to supply the count instead.
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "dispatch() requires an explicit num_dispatched_tokens during CUDA "
+                    "graph capture, because the output shape is data dependent and the "
+                    "count cannot be read back from the device while capturing. Pass an "
+                    "upper bound on the number of tokens this rank will receive."
+                )
             # Synchronize the stream to make sure the data in the pinned_memory_buffer: num_dispatched_tokens_tensor is ready.
             torch.cuda.current_stream().synchronize()
-            num_dispatched_tokens = num_dispatched_tokens_tensor.item()
 
         dispatched_token, dispatched_probs, dispatched_scaling_factor = (
             self.runtime.dispatch(
-                config=config,
                 hidden=hidden,
                 probs=probs,
                 scaling_factor=scaling_factor,
-                sparse_to_dense_map=sparse_to_dense_map,
-                rdma_to_attn_map=rdma_to_attn_map,
-                attn_to_rdma_map=attn_to_rdma_map,
-                num_dispatched_tokens_tensor=num_dispatched_tokens_tensor,
-                num_dispatched_tokens=num_dispatched_tokens,
-                num_of_tokens_per_rank=num_of_tokens,
+                handle=handle_impl,
                 with_probs=probs is not None,
+                num_dispatched_tokens=num_dispatched_tokens,
             )
         )
 
@@ -389,7 +493,16 @@ class HybridEPBuffer:
             dispatched_token,
             dispatched_probs,
             dispatched_scaling_factor,
-            handle,
+            (
+                handle_impl.sparse_to_dense_map,
+                handle_impl.rdma_to_attn_map,
+                handle_impl.attn_to_rdma_map,
+                handle_impl.num_dispatched_tokens_tensor,
+                handle_impl.local_expert_routing_map,
+                handle_impl.num_of_tokens_per_rank,
+                handle_impl.config,
+                handle_impl.num_of_valid_tokens,
+            ),
         )
 
     def combine(
@@ -398,25 +511,27 @@ class HybridEPBuffer:
         """
         Combine the data from the experts.
         Do not require preprocessing, but the handle is necessary.
+        Returns handle.num_of_valid_tokens rows (the local token count passed
+        to the matching dispatch).
         """
         assert handle is not None, "The handle is necessary for combine."
+        handle_impl = hybrid_ep_cpp.HandleImpl()
         (
-            sparse_to_dense_map,
-            rdma_to_attn_map,
-            attn_to_rdma_map,
-            _,
-            _,
-            num_of_tokens,
-            config,
+            handle_impl.sparse_to_dense_map,
+            handle_impl.rdma_to_attn_map,
+            handle_impl.attn_to_rdma_map,
+            handle_impl.num_dispatched_tokens_tensor,
+            handle_impl.local_expert_routing_map,
+            handle_impl.num_of_tokens_per_rank,
+            handle_impl.config,
+            handle_impl.num_of_valid_tokens,
         ) = handle
+        self._check_handle_buffer_compat(handle_impl)
+
         combined_token, combined_probs = self.runtime.combine(
-            config=config,
             hidden=hidden,
             probs=probs,
-            sparse_to_dense_map=sparse_to_dense_map,
-            rdma_to_attn_map=rdma_to_attn_map,
-            attn_to_rdma_map=attn_to_rdma_map,
-            num_of_tokens_per_rank=num_of_tokens,
+            handle=handle_impl,
             with_probs=probs is not None,
         )
         return combined_token, combined_probs
@@ -438,31 +553,46 @@ class HybridEPBuffer:
         num_permuted_tokens: int = None,
         # If we use permute kernel, the output tensor will be permuted. the result can be directly used in the gemm.
         pad_multiple: int = None,
+        # Group-uniform token-slot count (identical on every rank; >= hidden.size(0)).
+        # Lets ranks dispatch unequal token counts; see dispatch().
+        num_of_tokens_per_rank: int = None,
         # The handle means the cached info from the first invocation of the dispatch kernel.
-        # The handle includes:
-        # # Output of Metadata Preprocessing
+        # The dense-layout handle keeps the full metadata interface:
         # 1. sparse_to_dense_map
         # 2. rdma_to_attn_map
         # 3. attn_to_rdma_map
-        # 4. num_of_tokens_for_experts_tensor
+        # 4. num_dispatched_tokens_tensor
         # 5. local_expert_routing_map
-        # # Output of Permute Preprocessing
-        # 6. row_id_map
-        # # Cache for template config
-        # 7. template_config: HybridEpConfigInstance
+        # 6. dense_chunk_layout
+        # 7. dense_to_expert_map
+        # 8. tokens_per_expert
+        # 9. num_of_tokens_per_rank
+        # 10. template_config: HybridEpConfigInstance
+        # 11. num_of_valid_tokens
+        # 12. overflow_flag (keep last for callers using handle[-1])
         handle: tuple = None,
-        # There are 2 tensors are put on the CPU pinned memory
-        # 1. num_dispatched_tokens in handle
-        # 2. tokens_per_expert
-        # If non_blocking is True, no stream synchronization will be used, the all output are on the GPU.
-        # Otherwise, num_dispatched_tokens_tensor and tokens_per_expert are on the CPU pinned memory, the stream synchronization will be used to wait for the data in pinned memory.
+        # If non_blocking is True, no stream synchronization will be used, the metadata outputs are on the GPU.
+        # Otherwise, tokens_per_expert is copied through pinned memory so Python can derive num_permuted_tokens.
         non_blocking: bool = False,
+        fuse_permute_dispatch: bool = False,
         # Deprecated parameters
         num_dispatched_tokens: int = None,
         use_host_meta: bool = None,
     ):
         """
         Dispatch the data to the experts with permute.
+        When routing_map is omitted, topk_idx is passed directly as int16 when dense routing
+        limits allow it (skipping indices_to_map), otherwise it falls back to the sparse map.
+        If both routing_map and topk_idx are provided, routing_map takes precedence.
+
+        Ranks may dispatch unequal token counts: pass `num_of_tokens_per_rank`
+        as a group-uniform token-slot count (identical on every rank, e.g. the
+        group-wide max of the local counts, any value >= hidden.size(0)). The
+        routing data is padded internally with routed-nowhere rows, which cost
+        no communication and no expert compute; `combine_with_unpermute`
+        returns exactly hidden.size(0) rows. When omitted, it defaults to
+        hidden.size(0) and all ranks must dispatch the same count (the
+        previous behavior).
         """
         if num_dispatched_tokens is not None:
             warnings.warn("The num_dispatched_tokens is deprecated, it will be removed in the future.")
@@ -471,107 +601,106 @@ class HybridEPBuffer:
             non_blocking = not use_host_meta
 
         with _nvtx_range("hybrid-ep dispatch with permute phase"):
-            num_of_tokens_per_rank, hidden_dim = hidden.shape
-            if routing_map is not None:
-                assert routing_map.dtype == torch.bool
-                num_of_experts = routing_map.size(-1)
-            else:
-                # Generate the routing map and the probs according to the topk_idx and topk_weights.
-                if topk_idx is not None:
-                    assert (
-                        num_of_experts is not None
-                    ), "The number of experts should be provided on index-based routing."
-                    routing_map, probs = indices_to_map(
-                        topk_idx, topk_weights, num_of_tokens_per_rank, num_of_experts
-                    )
+            num_of_valid_tokens, hidden_dim = hidden.shape
+            topk, routing_data, probs, _ = self._prepare_routing_data(
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                num_of_tokens=num_of_valid_tokens,
+                num_of_experts=num_of_experts,
+                probs=probs,
+                routing_map=routing_map,
+                num_of_experts_per_rank=num_of_experts_per_rank,
+            )
             if non_blocking:
-                assert num_permuted_tokens >= 0, "The num_permuted_tokens is required for non-blocking mode."
+                assert num_permuted_tokens is not None and num_permuted_tokens >= 0, \
+                    "The num_permuted_tokens is required for non-blocking mode."
+                if pad_multiple is not None and pad_multiple > 0:
+                    assert num_permuted_tokens % pad_multiple == 0, \
+                        f"num_permuted_tokens ({num_permuted_tokens}) must be a multiple of pad_multiple ({pad_multiple}) in non-blocking mode."
 
-            # If the handle is not provided, we need to generate the handle in the first invocation of the dispatch kernel.
             if handle is None:
-                assert hidden.size(0) == routing_map.size(
+                assert hidden.size(0) == routing_data.size(
                     0
-                ), "The hidden and the routing_map should have the same row number."
-                # Update the template config.
+                ), "The hidden and the routing data should have the same row number."
+                num_of_token_slots = self._resolve_token_slots(
+                    num_of_tokens_per_rank, num_of_valid_tokens
+                )
+                routing_data = self._pad_routing_rows(routing_data, topk, num_of_token_slots)
                 config = self.update_template_config(
                     hidden_dim=hidden_dim,
-                    num_of_tokens_per_rank=num_of_tokens_per_rank,
+                    num_of_tokens_per_rank=num_of_token_slots,
                     num_local_experts=num_of_experts_per_rank,
+                    pad_multiple=pad_multiple,
                     use_fp8=use_fp8,
+                    fuse_permute_dispatch=fuse_permute_dispatch,
+                    topk=topk,
                 )
-                # Run the metadata preprocessing kernel.
-                row_id_map = None
-                (
-                    sparse_to_dense_map,
-                    rdma_to_attn_map,
-                    attn_to_rdma_map,
-                    num_dispatched_tokens_tensor,
-                    local_expert_routing_map,
-                ) = self.runtime.metadata_preprocessing(
+                handle_impl = self.runtime.metadata_preprocessing(
                     config=config,
-                    routing_map=routing_map,
-                    num_of_tokens_per_rank=num_of_tokens_per_rank,
+                    routing_map=routing_data,
+                    num_of_tokens_per_rank=num_of_token_slots,
+                    num_of_valid_tokens=num_of_valid_tokens,
+                    num_permuted_tokens=num_permuted_tokens,
+                    pad_multiple=pad_multiple,
+                    enable_permute=True,
+                    fuse_permute_dispatch=fuse_permute_dispatch,
                     non_blocking=non_blocking,
                 )
             else:
+                handle_impl = hybrid_ep_cpp.HandleImpl()
                 (
-                    sparse_to_dense_map,
-                    rdma_to_attn_map,
-                    attn_to_rdma_map,
-                    num_dispatched_tokens_tensor,
-                    local_expert_routing_map,
-                    row_id_map,
-                    num_of_tokens_per_rank_in_handle,
-                    config,
-                    overflow_flag,
+                    handle_impl.sparse_to_dense_map,
+                    handle_impl.rdma_to_attn_map,
+                    handle_impl.attn_to_rdma_map,
+                    handle_impl.num_dispatched_tokens_tensor,
+                    handle_impl.local_expert_routing_map,
+                    handle_impl.dense_chunk_layout,
+                    handle_impl.dense_to_expert_map,
+                    handle_impl.tokens_per_expert,
+                    handle_impl.num_of_tokens_per_rank,
+                    handle_impl.config,
+                    handle_impl.num_of_valid_tokens,
+                    handle_impl.overflow_flag,
                 ) = handle
-                if num_of_tokens_per_rank_in_handle != num_of_tokens_per_rank:
+                self._check_handle_buffer_compat(handle_impl)
+                handle_impl.num_permuted_tokens = num_permuted_tokens
+                if handle_impl.num_of_valid_tokens != num_of_valid_tokens:
                     warnings.warn("This handle could be invalid.")
 
-            # Dispatch phase
             (
                 dispatched_token,
                 dispatched_probs,
                 dispatched_scaling_factor,
-                overflow_flag,
-                row_id_map,
-                tokens_per_expert,
             ) = self.runtime.dispatch_with_permute(
-                config=config,
                 hidden=hidden,
                 probs=probs,
                 scaling_factor=scaling_factor,
-                sparse_to_dense_map=sparse_to_dense_map,
-                rdma_to_attn_map=rdma_to_attn_map,
-                attn_to_rdma_map=attn_to_rdma_map,
-                num_dispatched_tokens_tensor=num_dispatched_tokens_tensor,
-                local_expert_routing_map=local_expert_routing_map,
-                row_id_map=row_id_map,
-                num_permuted_tokens=num_permuted_tokens,
-                num_of_tokens_per_rank=num_of_tokens_per_rank,
+                handle=handle_impl,
                 pad_multiple=pad_multiple,
+                fuse_permute_dispatch=fuse_permute_dispatch,
                 non_blocking=non_blocking,
                 with_probs=probs is not None,
             )
 
-            handle = (
-                sparse_to_dense_map,
-                rdma_to_attn_map,
-                attn_to_rdma_map,
-                num_dispatched_tokens_tensor,
-                local_expert_routing_map,
-                row_id_map,
-                num_of_tokens_per_rank,
-                config,
-                overflow_flag,
-            )
-        
         return (
             dispatched_token,
             dispatched_probs,
             dispatched_scaling_factor,
-            tokens_per_expert,
-            handle,
+            handle_impl.padded_tokens_per_expert,
+            (
+                handle_impl.sparse_to_dense_map,
+                handle_impl.rdma_to_attn_map,
+                handle_impl.attn_to_rdma_map,
+                handle_impl.num_dispatched_tokens_tensor,
+                handle_impl.local_expert_routing_map,
+                handle_impl.dense_chunk_layout,
+                handle_impl.dense_to_expert_map,
+                handle_impl.tokens_per_expert,
+                handle_impl.num_of_tokens_per_rank,
+                handle_impl.config,
+                handle_impl.num_of_valid_tokens,
+                handle_impl.overflow_flag,
+            ),
         )
 
     def combine_with_unpermute(
@@ -582,6 +711,8 @@ class HybridEPBuffer:
         probs: torch.Tensor = None,
         handle: tuple = None,
         pad_multiple: int = None,
+        fuse_unpermute_combine: bool = False,
+        non_blocking: bool = False,
         # Deprecated parameters
         num_dispatched_tokens: int = None,
     ):
@@ -593,32 +724,32 @@ class HybridEPBuffer:
             warnings.warn("The num_dispatched_tokens is deprecated, it will be removed in the future.")
 
         with _nvtx_range("hybrid-ep combine with unpermute phase"):
-            assert self.config is not None, "Please initialize the config first."
+            assert self.configurer is not None, "Please initialize the configurer first."
             assert handle is not None, "The handle is necessary in the combine pass."
 
+            handle_impl = hybrid_ep_cpp.HandleImpl()
             (
-                sparse_to_dense_map,
-                rdma_to_attn_map,
-                attn_to_rdma_map,
-                num_dispatched_tokens_tensor,
-                _,
-                row_id_map,
-                num_of_tokens_per_rank,
-                config,
-                _,
+                handle_impl.sparse_to_dense_map,
+                handle_impl.rdma_to_attn_map,
+                handle_impl.attn_to_rdma_map,
+                handle_impl.num_dispatched_tokens_tensor,
+                handle_impl.local_expert_routing_map,
+                handle_impl.dense_chunk_layout,
+                handle_impl.dense_to_expert_map,
+                handle_impl.tokens_per_expert,
+                handle_impl.num_of_tokens_per_rank,
+                handle_impl.config,
+                handle_impl.num_of_valid_tokens,
+                handle_impl.overflow_flag,
             ) = handle
-
+            self._check_handle_buffer_compat(handle_impl)
             combined_token, combined_probs = self.runtime.combine_with_unpermute(
-                config=config,
                 hidden=hidden,
                 probs=probs,
-                sparse_to_dense_map=sparse_to_dense_map,
-                rdma_to_attn_map=rdma_to_attn_map,
-                attn_to_rdma_map=attn_to_rdma_map,
-                num_dispatched_tokens_tensor=num_dispatched_tokens_tensor,
-                row_id_map=row_id_map,
-                num_of_tokens_per_rank=num_of_tokens_per_rank,
+                handle=handle_impl,
                 pad_multiple=pad_multiple,
+                fuse_unpermute_combine=fuse_unpermute_combine,
+                non_blocking=non_blocking,
                 with_probs=probs is not None,
             )
         return combined_token, combined_probs

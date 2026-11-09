@@ -3,8 +3,11 @@
 
 #include "allgather.cuh"
 
+#include <algorithm>
+#include <cstdint>
+
 #define MAX_BLOCKS 256
-#define TIMEOUT 20000000000ull
+#define TIMEOUT 200000000000ull
 
 template<int SHARED_SIZE = 1024>
 __global__ void ag_nvl_kernel(
@@ -83,7 +86,7 @@ __global__ void ag_nvl_kernel(
         if (clock64() - s > 2ull * TIMEOUT) {
           printf("HYBRID-EP ALLGATHER TIMEOUT:SM %d [%d]:expecting %llu got %llu\n", blockIdx.x,
                   threadIdx.x, (unsigned long long)expected, flag_data);
-          break;
+          __trap();
         }
       }while(flag_data < expected);
     }
@@ -109,28 +112,43 @@ void CustomAllgather::launch(torch::Tensor src, int ag_sms, cudaStream_t stream)
     );
 }
 
-void CustomAllgather::init(int rank_idx, int num_of_ranks_per_node, int num_of_experts_per_rank, int num_of_tokens_per_rank, int num_of_nodes, ExtendedMemoryAllocator* allocator, pybind11::object process_group) {
+void CustomAllgather::init(pybind11::object process_group, int rank_idx, BufferConfig buffer_config, ExtendedMemoryAllocator* allocator) {
     this->rank_idx = rank_idx;
-    this->num_of_ranks_per_node = num_of_ranks_per_node;
-    this->num_of_experts_per_rank = num_of_experts_per_rank;
-    this->num_of_tokens_per_rank = num_of_tokens_per_rank;
-    this->num_of_nodes = num_of_nodes;
-    this->allocator = allocator;
-    this->process_group = process_group;
-}
-
-void CustomAllgather::update(BufferConfig buffer_config) {
     this->num_of_ranks_per_node = buffer_config.num_of_ranks_per_node;
     this->num_of_experts_per_rank = buffer_config.num_of_experts_per_rank;
     this->num_of_tokens_per_rank = buffer_config.max_num_of_tokens_per_rank;
     this->num_of_nodes = buffer_config.num_of_nodes;
+    this->routing_bytes_per_token = num_of_experts_per_rank * num_of_ranks_per_node * num_of_nodes * sizeof(bool);
+    this->allocator = allocator;
+    this->process_group = process_group;
+}
+
+bool CustomAllgather::grow_buffer_config(const HybridEpConfigInstance& config, BufferConfig& buf_config) {
+    bool changed = false;
+    changed |= grow_to(buf_config.num_of_ranks_per_node, config.num_of_ranks_per_node);
+    changed |= grow_to(buf_config.num_of_experts_per_rank, config.num_of_experts_per_rank);
+    changed |= grow_to(buf_config.max_num_of_tokens_per_rank, config.max_num_of_tokens_per_rank);
+    changed |= grow_to(buf_config.num_of_nodes, config.num_of_nodes);
+    int sparse_bytes_per_token = config.num_of_experts_per_rank * config.num_of_ranks_per_node * config.num_of_nodes * sizeof(bool);
+    int dense_bytes_per_token = config.topk > 0 ? config.topk * static_cast<int>(sizeof(int16_t)) : 0;
+    changed |= grow_to(routing_bytes_per_token, std::max(sparse_bytes_per_token, dense_bytes_per_token));
+    return changed;
+}
+
+void CustomAllgather::update_config(BufferConfig config) {
+    this->num_of_ranks_per_node = config.num_of_ranks_per_node;
+    this->num_of_experts_per_rank = config.num_of_experts_per_rank;
+    this->num_of_tokens_per_rank = config.max_num_of_tokens_per_rank;
+    this->num_of_nodes = config.num_of_nodes;
+}
+
+void CustomAllgather::allocate_buffers() {
+    allocate_ag_buffer();
 }
 
 void CustomAllgather::allocate_ag_buffer() {
     // Allocate the output buffer
-    auto num_of_expert = num_of_experts_per_rank * num_of_ranks_per_node * num_of_nodes;
-    auto gathered_elets = num_of_expert * num_of_tokens_per_rank * num_of_ranks_per_node * num_of_nodes;
-    auto gathered_bytes = gathered_elets * sizeof(bool);
+    auto gathered_bytes = routing_bytes_per_token * num_of_tokens_per_rank * num_of_ranks_per_node * num_of_nodes;
     allocator->allocate(&dst_buffer, gathered_bytes);
 
     if(num_of_nodes == 1) {
@@ -222,29 +240,53 @@ void CustomAllgather::open_ag_handles() {
 
 void CustomAllgather::destroy() {
     if(num_of_nodes == 1) {
-        if(rank_idx == 0) {
-            allocator->free(flag_nvl_ptr);
-        }else{
-            allocator->close_handle(flag_nvl_ptr);
-        }
-        CUDA_CHECK(cudaFree(flag_sm_ptr));
-        CUDA_CHECK(cudaFree(iter_id_ptr));
-    
-        // Close remote memory handles (not locally allocated, just mapped)
-        for(int i = 0; i < num_of_ranks_per_node; i++) {
-            if(i != rank_idx) {
-                allocator->close_handle(dst_buffers_all_ranks[i]);
+        if (flag_nvl_ptr != nullptr) {
+            if(rank_idx == 0) {
+                allocator->free(flag_nvl_ptr);
+            } else {
+                allocator->close_handle(flag_nvl_ptr);
             }
+            flag_nvl_ptr = nullptr;
         }
         
-        // Free the local buffers
-        CUDA_CHECK(cudaFree(dst_buffers_all_ranks_gpu));
-        free(dst_buffers_all_ranks);
+        if (flag_sm_ptr != nullptr) {
+            CUDA_CHECK(cudaFree(flag_sm_ptr));
+            flag_sm_ptr = nullptr;
+        }
+        
+        if (iter_id_ptr != nullptr) {
+            CUDA_CHECK(cudaFree(iter_id_ptr));
+            iter_id_ptr = nullptr;
+        }
+    
+        // Close remote memory handles (not locally allocated, just mapped)
+        if (dst_buffers_all_ranks != nullptr) {
+            for(int i = 0; i < num_of_ranks_per_node; i++) {
+                if(i != rank_idx) {
+                    allocator->close_handle(dst_buffers_all_ranks[i]);
+                }
+            }
+            free(dst_buffers_all_ranks);
+            dst_buffers_all_ranks = nullptr;
+        }
+        
+        // Free the GPU buffer
+        if (dst_buffers_all_ranks_gpu != nullptr) {
+            CUDA_CHECK(cudaFree(dst_buffers_all_ranks_gpu));
+            dst_buffers_all_ranks_gpu = nullptr;
+        }
     }
     
-    allocator->free(dst_buffer);
+    if (dst_buffer != nullptr) {
+        allocator->free(dst_buffer);
+        dst_buffer = nullptr;
+    }
 }
 
 void * CustomAllgather::get_output_buffer() {
     return dst_buffer;
+}
+
+CustomAllgather::~CustomAllgather() {
+    destroy();
 }

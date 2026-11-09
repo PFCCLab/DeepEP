@@ -8,6 +8,10 @@
 
  #ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
  #include <arpa/inet.h>
+ #include <cerrno>
+ #include <climits>
+ #include <cstdlib>
+ #include <cstring>
  #include <fcntl.h>
  #include <infiniband/verbs.h>
  #include <sys/socket.h>
@@ -20,6 +24,39 @@
    static const int IB_ROCE_VERSION_NUM = 2;
    static const sa_family_t DEFAULT_FAMILY = AF_INET;
    static const char NCCL_IB_ADDR_RANGE[] = { 0 };
+
+   static ncclResult_t envIbGidIndex(int* gidIndex) {
+     const char* env = std::getenv("NCCL_IB_GID_INDEX");
+     if (env == nullptr || env[0] == '\0') {
+       *gidIndex = IB_GID_INDEX;
+       return ncclSuccess;
+     }
+
+     char* end = nullptr;
+     errno = 0;
+     const long value = std::strtol(env, &end, 10);
+     if (errno != 0 || end == env || *end != '\0' || value < -1 || value > INT_MAX) {
+       fprintf(stderr, "[Error] NCCL_IB_GID_INDEX must be an integer greater than or equal to -1, got '%s'\n", env);
+       return ncclInvalidArgument;
+     }
+
+     *gidIndex = static_cast<int>(value);
+     return ncclSuccess;
+   }
+
+   static sa_family_t envIbAddrFamily() {
+     const char* env = std::getenv("NCCL_IB_ADDR_FAMILY");
+     if (env == nullptr || env[0] == '\0') {
+       return DEFAULT_FAMILY;
+     }
+     if (std::strcmp(env, "AF_INET") == 0) {
+       return AF_INET;
+     }
+     if (std::strcmp(env, "AF_INET6") == 0) {
+       return AF_INET6;
+     }
+     return DEFAULT_FAMILY;
+   }
  
    int ncclIbExtractFlid(union ibv_gid *gid) {
      return ntohs(*((uint16_t*)((uintptr_t)(gid->raw) + 4)));
@@ -184,7 +221,8 @@
  
    }
  
- static ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum, struct ibv_port_attr* portAttr, int *gidIndex) {
+ static ncclResult_t ncclIbGetGidIndex(struct ibv_context *context, uint8_t portNum,
+                                      struct ibv_port_attr* portAttr, int *gidIndex) {
    int gidTblLen = portAttr->gid_tbl_len;
    //for IB, choose GID Index that will have routable FLID if present
    if (portAttr->link_layer == IBV_LINK_LAYER_INFINIBAND) {
@@ -201,11 +239,23 @@
      return ncclSuccess;
    }
    //for ROCE
-   *gidIndex = IB_GID_INDEX;
+   NCCL_CHECK(envIbGidIndex(gidIndex));
    if (*gidIndex >= 0) {
+     if (*gidIndex >= gidTblLen) {
+       fprintf(stderr, "[Error] NCCL_IB_GID_INDEX=%d exceeds GID table length %d\n",
+               *gidIndex, gidTblLen);
+       return ncclInvalidArgument;
+     }
+     union ibv_gid gid;
+     CALL_CHECK(ibv_query_gid(context, portNum, *gidIndex, &gid));
+     if (!configuredGid(&gid)) {
+       fprintf(stderr, "[Error] NCCL_IB_GID_INDEX=%d does not reference a configured GID\n",
+               *gidIndex);
+       return ncclInvalidArgument;
+     }
      return ncclSuccess;
    }
-   sa_family_t userAddrFamily = DEFAULT_FAMILY;
+   sa_family_t userAddrFamily = envIbAddrFamily();
    int userRoceVersion = IB_ROCE_VERSION_NUM;
    int prefixlen;
    void *prefix = envIbAddrRange(userAddrFamily, &prefixlen);

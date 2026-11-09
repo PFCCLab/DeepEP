@@ -20,7 +20,9 @@ def init_dist(local_rank: int, num_local_ranks: int):
     group = paddle.distributed.new_group(list(range(num_local_ranks * num_nodes)))
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device('cuda')
-    torch.cuda.set_device(local_rank)
+    # The caller passes the global rank, which is not a device index once the job
+    # spans more than one node; paddle's launcher exports the per-node rank.
+    torch.cuda.set_device(int(os.getenv('PADDLE_LOCAL_RANK', local_rank)))
 
     return dist.get_rank(), dist.get_world_size(), group
 
@@ -421,6 +423,14 @@ def hash_tensor(t: torch.Tensor):
     return t.view(torch.int).sum().item()
 
 
+def _index_select_rows(t: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    # Paddle has no uint8 `index_select` kernel. FP8 payloads are carried as uint8, so
+    # reinterpret the bytes as fp8 for the gather and reinterpret the result back.
+    if t.dtype == torch.uint8:
+        return t.view(torch.float8_e4m3fn).index_select(0, indices).view(torch.uint8)
+    return t.index_select(0, indices)
+
+
 def permute(
     tokens,
     routing_map,
@@ -448,8 +458,8 @@ def permute(
         permuted_probs = probs.T.contiguous().masked_select(routing_map)
 
     # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
-    permuted_scaling_factor = scaling_factor.index_select(0, sorted_indices)
+    permuted_input = _index_select_rows(tokens, sorted_indices)
+    permuted_scaling_factor = _index_select_rows(scaling_factor, sorted_indices)
 
     return permuted_input, permuted_probs, permuted_scaling_factor
 
@@ -577,6 +587,21 @@ class TorchRef:
         )
 
         if enable_permute:
+            # Build local_expert_routing_map from global_routing_map if not provided
+            if local_expert_routing_map is None:
+                start, end = self._local_expert_range()
+                row_mask = global_routing_map[:, start:end].any(dim=1)
+                local_expert_routing_map = global_routing_map[row_mask, start:end]
+            if out_token_num is None:
+                token_per_expert = local_expert_routing_map.sum(dim=0, dtype=torch.int64)
+                if pad_multiple > 0:
+                    out_token_num = sum(
+                        (int(t) + pad_multiple - 1) // pad_multiple * pad_multiple
+                        for t in token_per_expert
+                    )
+                else:
+                    out_token_num = local_expert_routing_map.sum().item()
+
             dispatched_hidden, dispatched_probs, dispatched_scaling_factor = permute(
                 dispatched_hidden,
                 local_expert_routing_map,
@@ -589,7 +614,7 @@ class TorchRef:
                 token_per_expert = local_expert_routing_map.sum(dim=0, dtype=torch.int64)
                 padd_m_split = [
                     (i + pad_multiple - 1) // pad_multiple * pad_multiple
-                    for i in token_per_expert
+                    for i in token_per_expert.tolist()
                 ]
 
                 device = dispatched_hidden.device
@@ -661,8 +686,10 @@ def count_rdma_send_from_routing_map(routing_map: torch.Tensor, local_node_id: i
     # # 2. Set the local node map to zeros
     # To align with the implementation in the DeepEP, we do not set the local node map to zeros.
     # routing_map[:, local_node_id, :] = 0
-    # 3. reduce_max for unique routed tokens for each node 
-    rdma_routing_map = routing_map.max(dim=-1).values 
+    # 3. reduce_max for unique routed tokens for each node
+    # The routing map is boolean, so `any` is the reduce_max and, unlike
+    # `max(dim=...)`, it exists in Paddle's compat layer.
+    rdma_routing_map = routing_map.any(dim=-1)
 
     return rdma_routing_map.sum().item()
 

@@ -12,11 +12,13 @@
 // #include <torch/torch.h>
 #include <torch/python.h>
 #include <vector>
+#include <memory>
 #include <algorithm>
 #include <string>
 
+#include "buffer/intranode.cuh"
 #ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
-#include "internode.cuh"
+#include "buffer/internode.cuh"
 #endif
 
 class HybridEPBuffer {
@@ -28,92 +30,71 @@ public:
   ~HybridEPBuffer();
   bool update_buffer(HybridEpConfigInstance config); // True means the buffer is reallocated.
 
-  // Exchange IPC addresses using C++ distributed communication
-  void exchange_remote_handle();
+  // Incremented on every buffer reallocation. Handles record the generation
+  // they were created against (via HybridEpConfigInstance::buffer_generation)
+  // so stale-handle replay can be rejected. Starts at 1 so a config that was
+  // never stamped (generation 0) can never match a live buffer.
+  uint64_t buffer_generation = 1;
 
-  std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-             torch::Tensor>
-  metadata_preprocessing(HybridEpConfigInstance config, torch::Tensor global_routing_map, int64_t num_of_tokens_per_rank, bool non_blocking);
+  HandleImpl metadata_preprocessing(HybridEpConfigInstance config,
+    torch::Tensor local_routing_map,
+    int64_t num_of_tokens_per_rank,
+    c10::optional<int64_t> num_of_valid_tokens,
+    c10::optional<int64_t> num_permuted_tokens,
+    c10::optional<int64_t> pad_multiple,
+    bool enable_permute,
+    bool fuse_permute_dispatch,
+    bool non_blocking
+  );
 
   std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>>
-  dispatch(HybridEpConfigInstance config, 
-           torch::Tensor hidden, c10::optional<torch::Tensor> probs,
+  dispatch(torch::Tensor hidden, c10::optional<torch::Tensor> probs,
            c10::optional<torch::Tensor> scaling_factor,
-           torch::Tensor sparse_to_dense_map, torch::Tensor rdma_to_attn_map,
-           torch::Tensor attn_to_rdma_map, c10::optional<torch::Tensor> num_dispatched_tokens_tensor,
-           c10::optional<int64_t> num_dispatched_tokens,
-           int64_t num_of_tokens_per_rank,
-           bool with_probs);
+           HandleImpl handle,
+           bool with_probs,
+           c10::optional<int64_t> num_dispatched_tokens);
 
   std::tuple<torch::Tensor, torch::Tensor>
-  combine(HybridEpConfigInstance config, torch::Tensor hidden, c10::optional<torch::Tensor> probs,
-          torch::Tensor sparse_to_dense_map, torch::Tensor rdma_to_attn_map,
-          torch::Tensor attn_to_rdma_map, int64_t num_of_tokens_per_rank,
+  combine(torch::Tensor hidden, c10::optional<torch::Tensor> probs,
+          HandleImpl handle,
           bool with_probs);
   
-  std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor>
+  std::tuple<torch::Tensor, c10::optional<torch::Tensor>, c10::optional<torch::Tensor>>
   dispatch_with_permute(
-            HybridEpConfigInstance config, 
-            torch::Tensor hidden, c10::optional<torch::Tensor> probs,
+            torch::Tensor hidden, 
+            c10::optional<torch::Tensor> probs,
             c10::optional<torch::Tensor> scaling_factor,
-            torch::Tensor sparse_to_dense_map, torch::Tensor rdma_to_attn_map,
-            torch::Tensor attn_to_rdma_map, 
-            c10::optional<torch::Tensor> num_dispatched_tokens_tensor,
-            c10::optional<torch::Tensor> local_expert_routing_map,
-            c10::optional<torch::Tensor> row_id_map,
-            c10::optional<int64_t> num_permuted_tokens,
-            int64_t num_of_tokens_per_rank,
+            HandleImpl handle,
             c10::optional<int64_t> pad_multiple,
+            bool fuse_permute_dispatch,
             bool non_blocking,
             bool with_probs);
 
   std::tuple<torch::Tensor, torch::Tensor>
   combine_with_unpermute(
-          HybridEpConfigInstance config, 
-          torch::Tensor hidden, c10::optional<torch::Tensor> probs,
-          torch::Tensor sparse_to_dense_map, torch::Tensor rdma_to_attn_map,
-          torch::Tensor attn_to_rdma_map, c10::optional<torch::Tensor> num_dispatched_tokens_tensor,
-          c10::optional<torch::Tensor> row_id_map,
-          int64_t num_of_tokens_per_rank,
+          torch::Tensor hidden, 
+          c10::optional<torch::Tensor> probs,
+          HandleImpl handle,
           c10::optional<int64_t> pad_multiple,
+          bool fuse_unpermute_combine,
+          bool non_blocking,
           bool with_probs);       
 
 private:
-#ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
-  std::vector<std::string> ib_dev_name_list;
-  RDMACoordinator rdma_coordinator;
-#endif
   ExtendedMemoryAllocator remote_allocator;
+#ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
+#ifdef USE_NIXL
+  NIXLCoordinator internode_coordinator;
+#else
+  RDMACoordinator internode_coordinator;
+#endif
+#endif
+  NVLCoordinator nvl_coordinator;
   BufferConfig buffer_config;
   Executor executor;
   pybind11::object process_group;
   CustomAllgather allgather_obj;
 
   void allocate_buffer();
-  void allocate_buffer_for_preprocessing();
-  void allocate_buffer_for_dispatch();
-  void allocate_buffer_for_combine();
   void release_buffer();
-  void open_handles_from_other_ranks(std::vector<torch::Tensor> dispatch_handles,
-                                     std::vector<torch::Tensor> combine_handles);
-
-  // Meta data of communication group.
-  int local_rank;
-  int node_rank;
-  int group_size;
-  // Maximum number of tokens for experts.
-  int64_t max_num_of_tokens; 
-  // Only valid on intra-node communication. In this case, the dispatch/combine can share same buffers.
-  bool use_shared_buffer;
-
-  hybrid_ep::tmp_state_t *preprocessing_tmp;
-
-  // Buffers for dispatch
-  DispatchBuffers dispatch_buffers;
-  torch::Tensor dispatch_memory_handles; 
-
-  // Buffers for combine
-  CombineBuffers combine_buffers;
-  torch::Tensor combine_memory_handles;
-
 };

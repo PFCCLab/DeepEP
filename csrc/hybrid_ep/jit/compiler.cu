@@ -2,11 +2,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 #include "compiler.cuh"
+#include <any>
+#include <cstdio>
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <unistd.h>
 #include <pwd.h>
+#include <sys/types.h>
+#include <stdexcept>
 
 inline std::string get_env(std::string name) {
     const char* env = std::getenv(name.c_str());
@@ -27,7 +31,13 @@ std::string get_jit_dir() {
             cache_dir = "/tmp";  // Fallback 
         }
     }
-    return cache_dir + "/.deepep/hybrid_ep/jit";
+    // Use process-specific subdirectory to avoid race conditions when multiple
+    // processes compile kernels concurrently (e.g., torch.multiprocessing.spawn).
+    // Without this, one process could overwrite key.so while another loads it,
+    // causing "bad any_cast" when the wrong kernel type is loaded.
+    std::string base_jit = cache_dir + "/.deepep/hybrid_ep/jit";
+    std::string proc_jit = base_jit + "/proc-" + std::to_string(getpid());
+    return proc_jit;
 }
 
 namespace {
@@ -100,6 +110,29 @@ NVCCCompiler::NVCCCompiler(
 #ifdef HYBRID_EP_BUILD_MULTINODE_ENABLE
     // Add the dependency of the inter-node jit
     flags += " -DHYBRID_EP_BUILD_MULTINODE_ENABLE";
+#ifdef USE_NIXL
+    flags += " -DUSE_NIXL";
+    std::string nixl_home = get_env("NIXL_HOME");
+    if (nixl_home.empty()) nixl_home = "/usr/local/nixl";
+    std::string ucx_home = get_env("UCX_HOME");
+    if (ucx_home.empty()) ucx_home = "/usr";
+    include += " -I" + nixl_home + "/include ";
+    include += " -I" + nixl_home + "/include/gpu/ucx ";
+    include += " -I" + ucx_home + "/include ";
+    // Must match the directory setup.py links against, otherwise the inter-node
+    // JIT cannot find libnixl. The default assumes a Debian multiarch layout;
+    // NIXL_LIB_DIR overrides it for other distros and architectures.
+    std::string nixl_lib = get_env("NIXL_LIB_DIR");
+    if (nixl_lib.empty()) {
+#if defined(__aarch64__)
+        nixl_lib = nixl_home + "/lib/aarch64-linux-gnu";
+#else
+        nixl_lib = nixl_home + "/lib/x86_64-linux-gnu";
+#endif
+    }
+    library += " -L" + nixl_lib + " -lnixl -lnixl_build -lnixl_common ";
+    library += " -Xlinker -rpath -Xlinker " + nixl_lib + " ";
+#else
     if (rdma_include_dir.empty() || rdma_library_dir.empty()) {
         throw std::runtime_error(
             "Failed to locate RDMA core headers/libs for HybridEP JIT. Pass valid RDMA paths from Python.");
@@ -123,12 +156,13 @@ NVCCCompiler::NVCCCompiler(
         + doca_obj_path + "/doca_gpunetio_gdrcopy.o "
         + doca_obj_path + "/doca_gpunetio_log.o ";
 #endif
+#endif
 
     inter_node_flags = flags + " " + include + " " + library;
 }
   
 
-std::string NVCCCompiler::build(std::string code, std::string signature, int local_rank, int node_rank, int num_of_nodes) {
+std::string NVCCCompiler::build(std::string code, std::string signature, int local_rank, int node_rank, int num_of_nodes, bool enable_permute_fusion, bool enable_token_drop) {
     // Create the source directory
     std::filesystem::create_directories(jit_dir);
 
@@ -151,12 +185,26 @@ std::string NVCCCompiler::build(std::string code, std::string signature, int loc
         jit_dir + "/" + extended_signature + ".so";
     // Remove the output .so file if it exists
     remove(output_path.c_str());
+
+    // Build extra define flags
+    std::string extra_flags;
+    if (enable_permute_fusion) {
+        extra_flags += " -DHYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE";
+    }
+    if (enable_token_drop) {
+        extra_flags += " -DHYBRID_EP_BUILD_TOKEN_DROP_ENABLE";
+    }
+
     // Choose the flags based on the number of nodes
     std::string compile_command;
     if(num_of_nodes > 1) {
-        compile_command = nvcc_path + " " + inter_node_flags + " " + source_path + " " + objs + " -o " + output_path;
+#ifdef USE_NIXL
+        compile_command = nvcc_path + " " + inter_node_flags + extra_flags + " " + source_path + " -o " + output_path;
+#else
+        compile_command = nvcc_path + " " + inter_node_flags + extra_flags + " " + source_path + " " + objs + " -o " + output_path;
+#endif
     }else {
-        compile_command = nvcc_path + " " + intra_node_flags + " " + source_path + " -o " + output_path;
+        compile_command = nvcc_path + " " + intra_node_flags + extra_flags + " " + source_path + " -o " + output_path;
     }
     
     // Run the compile command
@@ -172,8 +220,10 @@ std::string NVCCCompiler::build(std::string code, std::string signature, int loc
 }
 
 std::any NVCCCompiler::get_instance(std::string library_path, std::string kernel_key) {
-    // Open the compiled library with RTLD_GLOBAL for symbol visibility
-    void* handle = dlopen(library_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    // Open the compiled library with RTLD_LOCAL to avoid symbol conflicts
+    // between JIT-compiled templates (e.g. with HYBRID_EP_BUILD_PERMUTE_FUSION_ENABLE)
+    // and the same template instantiated in the main module (without the macro).
+    void* handle = dlopen(library_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle == nullptr) {
         const char* error = dlerror();
         std::string error_msg = "Failed to open library: " + library_path + "\n";
@@ -219,7 +269,9 @@ std::string NVCCCompiler::get_metadata_preprocessing_code(HybridEpConfigInstance
          std::to_string(config.hidden_dim) + ", " + std::to_string(config.max_num_of_tokens_per_rank) + ", " +
          std::to_string(config.num_of_ranks_per_node) + ", " + std::to_string(config.num_of_nodes) + ", " +
          std::to_string(config.num_of_experts_per_rank) + ">::metadata_preprocessing<" +
-         std::to_string(config.num_of_threads_per_block_preprocessing_api) + ", " + std::to_string(config.num_of_blocks_preprocessing_api) + R"(>;
+         std::to_string(config.pad_multiple) + ", " + std::to_string(config.num_of_tokens_per_chunk_preprocessing_api) + ", " +
+         std::to_string(config.num_of_threads_per_block_preprocessing_api) + ", " + std::to_string(config.num_of_blocks_preprocessing_api) + ", " +
+         std::to_string(config.topk) + R"(>;
             return func_ptr;
           }
         }
@@ -240,8 +292,8 @@ std::string NVCCCompiler::get_dispatch_code(HybridEpConfigInstance config) {
          std::to_string(config.hidden_dim) + ", " + std::to_string(config.max_num_of_tokens_per_rank) + ", " +
          std::to_string(config.num_of_ranks_per_node) + ", " + std::to_string(config.num_of_nodes) + ", " +
          std::to_string(config.num_of_experts_per_rank) + ">::dispatch<" + token_type + ", " +
-         std::to_string(config.num_of_stages_dispatch_api) + ", " + std::to_string(config.num_of_in_flight_s2g_dispatch_api) + ", " + std::to_string(config.num_of_tokens_per_chunk_dispatch_api) + ", " +
-         std::to_string(config.num_of_blocks_dispatch_api) + ", " + (config.forward_dispatch_api ? "true" : "false") + ", " +
+         std::to_string(config.num_of_stages_dispatch_api) + ", " + std::to_string(config.num_of_stages_permute_block_dispatch_api) + ", " + std::to_string(config.num_of_in_flight_s2g_dispatch_api) + ", " + std::to_string(config.num_of_in_flight_s2g_permute_block_dispatch_api) + ", " + std::to_string(config.pad_multiple) + ", " + std::to_string(config.num_of_additional_in_flight_s2g_dispatch_api) + ", " + std::to_string(config.num_of_tokens_per_chunk_dispatch_api) + ", " +
+         std::to_string(config.num_of_blocks_dispatch_api) + ", " + std::to_string(config.num_of_blocks_permute) + ", " + (config.forward_dispatch_api ? "true" : "false") + ", " +
          (config.device_side_sync_dispatch_api ? "true" : "false") + R"(>;
             return func_ptr;
           }
@@ -261,9 +313,11 @@ std::string NVCCCompiler::get_combine_code(HybridEpConfigInstance config) {
          std::to_string(config.num_of_ranks_per_node) + ", " + std::to_string(config.num_of_nodes) + ", " +
          std::to_string(config.num_of_experts_per_rank) + ">::combine<" +
          std::to_string(config.num_of_stages_g2s_combine_api) + ", " + std::to_string(config.num_of_stages_s2g_combine_api) + ", " +
-         std::to_string(config.num_of_tokens_per_chunk_combine_api) + ", " + std::to_string(config.num_of_tokens_per_group_combine_api) +
-         ", " + std::to_string(config.num_of_blocks_combine_api) + ", " +
+         std::to_string(config.num_of_stages_g2s_unpermute_block) + ", " + std::to_string(config.num_of_stages_s2g_unpermute_block) + ", " +
+         std::to_string(config.num_of_tokens_per_chunk_combine_api) + ", " + std::to_string(config.num_of_tokens_per_group_combine_api) + ", " +
+         std::to_string(config.num_of_blocks_combine_api) + ", " + std::to_string(config.num_of_blocks_unpermute) + ", " +
          std::to_string(config.num_of_additional_in_flight_s2g_combine_api) + ", " +
+         std::to_string(config.num_of_additional_in_flight_s2g_unpermute_block_combine_api) + ", " +
          (config.backward_combine_api ? "true" : "false") + ", " +
          (config.device_side_sync_combine_api ? "true" : "false") + R"(>;
             return func_ptr;
@@ -295,7 +349,8 @@ node_rank(node_rank), local_rank(local_rank), nvcc_compiler(base_path, comm_id, 
     }
 }
 
-std::any KernelCache::get_or_build_kernel(std::string_view kernel_key, const std::string& code, int num_of_nodes) {
+std::any KernelCache::get_or_build_kernel(std::string_view kernel_key, const std::string& code, int num_of_nodes,
+                                          bool enable_permute_fusion, bool enable_token_drop) {
     auto it = kernel_cache.find(std::string(kernel_key));
     if (it != kernel_cache.end()) {
         return it->second;
@@ -313,59 +368,77 @@ std::any KernelCache::get_or_build_kernel(std::string_view kernel_key, const std
         return kernel_cache[std::string(kernel_key)];
     }
 
-    auto build_path = nvcc_compiler.build(code, std::string(kernel_key), local_rank, node_rank, num_of_nodes);
+    auto build_path = nvcc_compiler.build(code, std::string(kernel_key), local_rank, node_rank, num_of_nodes,
+                                          enable_permute_fusion, enable_token_drop);
     kernel_cache[std::string(kernel_key)] = nvcc_compiler.get_instance(build_path, std::string(kernel_key));
     return kernel_cache[std::string(kernel_key)];
 }
 
-void KernelCache::run_proprecess_kernel(
+void KernelCache::run_preprocess_kernel(
     HybridEpConfigInstance config, 
-    const bool* input_routing_map,
+    const void* input_routing_map,
     hybrid_ep::tmp_state_t* preprocessing_tmp,
+    hybrid_ep::tmp_state_t* preprocessing_local_experts_tmp,
     int32_t* sparse_to_dense_map,
     bool* rdma_to_attn_map,
     bool* attn_to_rdma_map,
     int32_t* num_of_tokens_for_experts,
     bool* local_expert_routing_map,
+    int32_t* dense_chunk_layout,
+    int32_t* dense_to_expert_map,
+    int32_t* num_of_local_experts_tokens,
+    int* token_drop_triggered,
     const int node_rank,
     const int local_rank,
-    int num_of_tokens_per_rank,
+    const int local_experts_tokens_limit,
+    const int num_of_tokens_per_rank,
+    bool fuse_permute_dispatch,
+    bool non_blocking,
     cudaStream_t stream
 ){
     // Generate the unique key to search the kernel in the cache
+    bool enable_token_drop = fuse_permute_dispatch && non_blocking;
     std::string preprocess_kernel_key = get_key(
         config.hidden_dim,
         config.max_num_of_tokens_per_rank,
         config.num_of_experts_per_rank,
         config.num_of_ranks_per_node,
         config.num_of_nodes,
+        config.pad_multiple,
+        config.num_of_tokens_per_chunk_preprocessing_api,
         config.num_of_threads_per_block_preprocessing_api,
-        config.num_of_blocks_preprocessing_api
+        config.num_of_blocks_preprocessing_api,
+        config.topk,
+        fuse_permute_dispatch,
+        non_blocking
     );
     
     auto preprocessing_code = nvcc_compiler.get_metadata_preprocessing_code(config);
-    auto preprocessing_instance = get_or_build_kernel(preprocess_kernel_key, preprocessing_code, config.num_of_nodes);
+    auto preprocessing_instance = get_or_build_kernel(preprocess_kernel_key, preprocessing_code, config.num_of_nodes,
+                                                      fuse_permute_dispatch, enable_token_drop);
 
     // Cast the function pointer to the correct type
-    using PreprocessingFuncPtr = void (*)(const bool*, hybrid_ep::tmp_state_t*, int32_t*, bool*, bool*, int32_t*, bool*, const int, const int, int, cudaStream_t);
+    using PreprocessingFuncPtr = void (*)(const void*, hybrid_ep::tmp_state_t*, hybrid_ep::tmp_state_t*, int32_t*, bool*, bool*, int32_t*, bool*, int32_t*, int32_t*, int32_t*, int*, const int, const int, const int, const int, cudaStream_t);
     auto func_ptr = std::any_cast<PreprocessingFuncPtr>(preprocessing_instance);
 
     // Run the kernel
-    func_ptr(input_routing_map, preprocessing_tmp, sparse_to_dense_map, rdma_to_attn_map,
-        attn_to_rdma_map, num_of_tokens_for_experts, local_expert_routing_map, node_rank,
-        local_rank, num_of_tokens_per_rank, stream);
+    func_ptr(input_routing_map, preprocessing_tmp, preprocessing_local_experts_tmp, sparse_to_dense_map, rdma_to_attn_map, attn_to_rdma_map, num_of_tokens_for_experts, local_expert_routing_map, dense_chunk_layout, dense_to_expert_map, num_of_local_experts_tokens, token_drop_triggered, node_rank, local_rank, local_experts_tokens_limit, num_of_tokens_per_rank, stream);
 
 }
 
 template void KernelCache::run_dispatch_kernel<uint8_t>(
     HybridEpConfigInstance config, 
     hybrid_ep::dispatch_kernel_param_t<uint8_t> param,
+    bool fuse_permute_dispatch,
+    bool non_blocking,
     cudaStream_t stream
 );
 
 template void KernelCache::run_dispatch_kernel<uint16_t>(
     HybridEpConfigInstance config, 
     hybrid_ep::dispatch_kernel_param_t<uint16_t> param,
+    bool fuse_permute_dispatch,
+    bool non_blocking,
     cudaStream_t stream
 );
 
@@ -373,9 +446,12 @@ template<typename DATA_TYPE>
 void KernelCache::run_dispatch_kernel(
     HybridEpConfigInstance config, 
     hybrid_ep::dispatch_kernel_param_t<DATA_TYPE> param,
+    bool fuse_permute_dispatch,
+    bool non_blocking,
     cudaStream_t stream
 ){
     // Generate the unique key to search the kernel in the cache
+    bool enable_token_drop = fuse_permute_dispatch && non_blocking;
     std::string dispatch_kernel_key = get_key(
         config.hidden_dim,
         config.max_num_of_tokens_per_rank,
@@ -384,20 +460,37 @@ void KernelCache::run_dispatch_kernel(
         config.num_of_nodes,
         type_to_string(config.token_data_type),
         config.num_of_stages_dispatch_api,
+        config.num_of_stages_permute_block_dispatch_api,
         config.num_of_in_flight_s2g_dispatch_api,
+        config.num_of_in_flight_s2g_permute_block_dispatch_api,
+        config.pad_multiple,
+        config.num_of_additional_in_flight_s2g_dispatch_api,
         config.num_of_tokens_per_chunk_dispatch_api,
         config.num_of_blocks_dispatch_api,
+        config.num_of_blocks_permute,
         config.forward_dispatch_api,
-        config.device_side_sync_dispatch_api
+        config.device_side_sync_dispatch_api,
+        fuse_permute_dispatch,
+        non_blocking
     );
 
+    // JIT Compile the kernel
     auto dispatch_code = nvcc_compiler.get_dispatch_code(config);
-    auto dispatch_instance = get_or_build_kernel(dispatch_kernel_key, dispatch_code, config.num_of_nodes);
+    auto dispatch_instance = get_or_build_kernel(dispatch_kernel_key, dispatch_code, config.num_of_nodes,
+                                                 fuse_permute_dispatch, enable_token_drop);
 
     // Cast the function pointer to the correct type
     using DispatchFuncPtr = void (*)(
         hybrid_ep::dispatch_kernel_param_t<DATA_TYPE>, cudaStream_t);
-    auto func_ptr = std::any_cast<DispatchFuncPtr>(dispatch_instance);
+    DispatchFuncPtr func_ptr;
+    try {
+        func_ptr = std::any_cast<DispatchFuncPtr>(dispatch_instance);
+    } catch (const std::bad_any_cast& e) {
+        throw std::runtime_error(
+            "Kernel cache type mismatch for dispatch (key=" + dispatch_kernel_key +
+            "): expected " + (sizeof(DATA_TYPE) == 1 ? "uint8_t" : "uint16_t") +
+            " kernel. Original error: " + std::string(e.what()));
+    }
 
     // Run the kernel
     func_ptr(param, stream);
@@ -406,9 +499,12 @@ void KernelCache::run_dispatch_kernel(
 void KernelCache::run_combine_kernel(
     HybridEpConfigInstance config, 
     hybrid_ep::combine_kernel_param_t param,
+    bool fuse_unpermute_combine,
+    bool non_blocking,
     cudaStream_t stream
 ){
     // Generate the unique key to search the kernel in the cache
+    bool enable_token_drop = fuse_unpermute_combine && non_blocking;
     std::string combine_kernel_key = get_key(
         config.hidden_dim,
         config.max_num_of_tokens_per_rank,
@@ -417,16 +513,24 @@ void KernelCache::run_combine_kernel(
         config.num_of_nodes,
         config.num_of_stages_g2s_combine_api,
         config.num_of_stages_s2g_combine_api,
+        config.num_of_stages_g2s_unpermute_block,
+        config.num_of_stages_s2g_unpermute_block,
         config.num_of_tokens_per_chunk_combine_api,
         config.num_of_tokens_per_group_combine_api,
         config.num_of_blocks_combine_api,
+        config.num_of_blocks_unpermute,
         config.num_of_additional_in_flight_s2g_combine_api,
+        config.num_of_additional_in_flight_s2g_unpermute_block_combine_api,
         config.backward_combine_api,
-        config.device_side_sync_combine_api
+        config.device_side_sync_combine_api,
+        fuse_unpermute_combine,
+        non_blocking
     );
 
+    // JIT Compile the kernel
     auto combine_code = nvcc_compiler.get_combine_code(config);
-    auto combine_instance = get_or_build_kernel(combine_kernel_key, combine_code, config.num_of_nodes);
+    auto combine_instance = get_or_build_kernel(combine_kernel_key, combine_code, config.num_of_nodes,
+                                                fuse_unpermute_combine, enable_token_drop);
     
     // Cast the function pointer to the correct type
     using CombineFuncPtr = void (*)(hybrid_ep::combine_kernel_param_t, cudaStream_t);
@@ -436,5 +540,3 @@ void KernelCache::run_combine_kernel(
     func_ptr(param, stream);
 }
 
-
-  

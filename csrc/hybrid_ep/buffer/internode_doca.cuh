@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved
 #pragma once
+
+#ifndef USE_NIXL
+
 #include <unordered_map>
 #include <cstdint>
 #include <pybind11/pybind11.h>
@@ -10,11 +13,14 @@
 #include <torch/python.h>
 #include <iostream>
 #include <dlfcn.h>
-#include "backend/hybrid_ep_backend.cuh"
-#include "backend/utils.cuh"
+#include "doca_gpunetio_host.h"
+#include "doca_gpunetio_device.h"
+#include "infiniband/verbs.h"
+#include "infiniband/mlx5dv.h"
+#include "coordinator.cuh"
 #include "backend/topo_detection.cuh"
 #include "backend/ibvcore.h"
-#include "config.cuh"
+#include "utils.cuh"
 
 #define RC  (0)
 #define UC  (1)
@@ -46,7 +52,6 @@ constexpr int32_t EQ_NUM = 0;
 constexpr int32_t GVERBS_WQ_BUF_LOC = DOCA_GPU_MEM_TYPE_GPU;
 constexpr int32_t GVERBS_CQ_BUF_LOC = DOCA_GPU_MEM_TYPE_GPU;
 constexpr int32_t GVERBS_USE_ASYNC_STIRE_RELEASE = 0;
-// We assume nic has one port.
 constexpr uint8_t IB_PORT = 1;
 constexpr int32_t INLINE_SIZE = 0;
 constexpr int32_t MTU = 0;
@@ -55,7 +60,6 @@ constexpr uint8_t QP_TIMEOUT = 22;
 constexpr uint8_t SL = 0;
 constexpr uint8_t TRAFFIC_CLASS = 0;
 constexpr enum memory_type MEMORY_TYPE = MEMORY_CUDA;
-// Port state array.
 static const char *portStates[] = {"Nop","Down","Init","Armed","","Active Defer"};
 
 struct doca_gpu_mtable {
@@ -69,28 +73,19 @@ struct doca_gpu_mtable {
 };
 
 struct doca_gpu {
-  CUdevice cuda_dev; /* CUDA device handler */
-  std::unordered_map<uintptr_t, struct doca_gpu_mtable *>
-      *mtable;                       /* Table of GPU/CPU memory allocated addresses */
-  bool support_gdrcopy;              ///< Boolean value that indicates if gdrcopy is
-                                     ///< supported
-  bool support_dmabuf;               ///< Boolean value that indicates if dmabuf is
-                                     ///< supported by the gpu
-  bool support_wq_gpumem;            ///< Boolean value that indicates if gpumem is
-                                     ///< available and nic-gpu mapping is supported
-  bool support_cq_gpumem;            ///< Boolean value that indicates if gpumem is
-                                     ///< available and nic-gpu mapping is supported
-  bool support_uar_gpumem;           ///< Boolean value that indicates if gpumem is
-                                     ///< available and gpu-nic mapping is supported
-  bool support_async_store_release;  ///< Boolean value that indicates if
-                                     ///< async store release is supported
-  bool support_bf_uar;               ///< Boolean value that indicates if BlueFlame
-                                     ///< is supported
+  CUdevice cuda_dev;
+  std::unordered_map<uintptr_t, struct doca_gpu_mtable *> *mtable;
+  bool support_gdrcopy;
+  bool support_dmabuf;
+  bool support_wq_gpumem;
+  bool support_cq_gpumem;
+  bool support_uar_gpumem;
+  bool support_async_store_release;
+  bool support_bf_uar;
 };
 
 struct gverbs_context {
     int pdn;
-    // struct ibv_port_attr port_attr;
     union ibv_gid gid;
     struct doca_gpu_verbs_qp_init_attr_hl *qp_init_attr;
     struct doca_verbs_qp_attr *qp_attr;
@@ -114,47 +109,51 @@ struct remote_info {
     uint64_t      scaling_factor_vaddr;
 };
 
-static ibv_device *ctx_find_dev(const char *ib_devname);
-static int get_gpu_handler(struct doca_gpu *handler,
-                           struct ibv_context *ib_context, int local_rank);
+ibv_device *ctx_find_dev(const char *ib_devname);
+int get_gpu_handler(struct doca_gpu *handler, struct ibv_context *ib_context, int local_rank);
 void setup_qp_init_attr(struct doca_gpu_verbs_qp_init_attr_hl *qp_init_attr,
-                        struct doca_gpu *gpu_handler, struct ibv_pd *ib_pd,
-                        int tx_depth);
+                        struct doca_gpu *gpu_handler, struct ibv_pd *ib_pd, int tx_depth);
 int create_and_place_qps(struct gverbs_context *g_ctx,
-                         struct doca_gpu_verbs_qp_init_attr_hl *qp_init_attr,
-                         int num_qps);
-static int setup_qp_attr_for_modify(struct ibv_port_attr *port_attr, struct doca_verbs_qp_attr *qp_attr, 
+                         struct doca_gpu_verbs_qp_init_attr_hl *qp_init_attr, int num_qps);
+int setup_qp_attr_for_modify(struct ibv_port_attr *port_attr, struct doca_verbs_qp_attr *qp_attr,
                                     struct remote_info *l_info, struct remote_info *r_info,
                                     struct ibv_context *ib_context);
 int doca_gpunetio_test_change_qp_state(struct doca_gpu_verbs_qp_hl *qp,
-                                       struct doca_verbs_qp_attr *qp_attr,
-                                       int attr_mask);
-static int setup_qp_attr_and_set_qp(struct gverbs_context *g_ctx,
+                                       struct doca_verbs_qp_attr *qp_attr, int attr_mask);
+int setup_qp_attr_and_set_qp(struct gverbs_context *g_ctx,
                                     struct ibv_context *ib_context,
                                     struct ibv_port_attr *port_attr,
                                     struct remote_info *rem_dest,
                                     struct doca_verbs_qp_attr *qp_attr,
                                     int num_of_blocks, int num_of_nodes,
                                     int node_rank, uint32_t qp_cnt);
-                                    
-class RDMACoordinator {
+
+class RDMACoordinator : public InterNodeCoordinator {
 public:
     RDMACoordinator() = default;
-    ~RDMACoordinator();
-    void init(pybind11::object process_group, int node_rank, int local_rank, BufferConfig config);
-    void update_config(BufferConfig config);
-    void destroy();
-    void allocate_dispatch_rdma_buffers(DispatchBuffers &dispatch_buffers);
-    void allocate_combine_rdma_buffers(CombineBuffers &combine_buffers);
+    ~RDMACoordinator() override;
+    void init(pybind11::object process_group, int node_rank, int local_rank, BufferConfig config) override;
+    bool grow_buffer_config(const HybridEpConfigInstance& config, BufferConfig& buf_config) override;
+    void update_config(BufferConfig config) override;
+    void allocate_buffers() override;
+    void destroy() override;
+
+    InterNodeDispatchBuffers& get_dispatch_buffers() override { return dispatch_buffers; }
+    InterNodeCombineBuffers& get_combine_buffers() override { return combine_buffers; }
+
+    InterNodeDispatchBuffers dispatch_buffers;
+    InterNodeCombineBuffers combine_buffers;
 
 private:
+    struct ibv_mr* register_gpu_memory(struct ibv_pd* pd, void* address, size_t length, int access);
+    void allocate_dispatch_buffers();
+    void allocate_combine_buffers();
     int gid_index = 0;
     int node_rank = -1;
     int local_rank = -1;
     BufferConfig buffer_config;
     pybind11::object process_group;
-    
-    // IB basic resources
+
     struct ibv_context *ib_context = nullptr;
     struct ibv_pd *ib_pd = nullptr;
     struct doca_gpu *gpu_handler = nullptr;
@@ -163,8 +162,6 @@ private:
     bool buffer_allocated = false;
     bool rdma_initialized = false;
 
-    // Detailed Dispatch RDMA resources
-    // Memory Region
     struct ibv_mr *attn_input_token_mr = nullptr;
     struct ibv_mr *dispatch_rdma_inter_node_group_token_mr = nullptr;
     struct ibv_mr *attn_input_flags_mr = nullptr;
@@ -173,27 +170,23 @@ private:
     struct ibv_mr *dispatch_rdma_inter_node_group_prob_mr = nullptr;
     struct ibv_mr *attn_input_token_scaling_factor_mr = nullptr;
     struct ibv_mr *dispatch_rdma_inter_node_group_scaling_factor_mr = nullptr;
-    // Misc
     struct remote_info *dispatch_remote_info_vec = nullptr;
     struct dispatch_memory_region_info_t *dispatch_mr_info_h = nullptr;
-    // Used for communication.
-    struct gverbs_context dispatch_gverbs_ctx;
-    struct dispatch_memory_region_info_t *dispatch_mr_info_d = nullptr;  
+    struct gverbs_context dispatch_gverbs_ctx {};
+    struct dispatch_memory_region_info_t *dispatch_mr_info_d = nullptr;
 
-    // Detailed Combine RDMA resources
-    // Memory Region
     struct ibv_mr *rdma_intra_node_red_token_mr = nullptr;
     struct ibv_mr *combine_rdma_inter_node_group_token_mr = nullptr;
     struct ibv_mr *rdma_intra_node_red_prob_mr = nullptr;
     struct ibv_mr *combine_rdma_inter_node_group_prob_mr = nullptr;
     struct ibv_mr *attn_output_flags_mr = nullptr;
     struct ibv_mr *combine_rdma_inter_node_group_flags_mr = nullptr;
-    // Misc
     struct remote_info *combine_remote_info_vec = nullptr;
     struct combine_memory_region_info_t *combine_mr_info_h = nullptr;
-    // Used for communication.
-    struct gverbs_context combine_gverbs_ctx;
-    struct combine_memory_region_info_t *combine_mr_info_d = nullptr;  
+    struct gverbs_context combine_gverbs_ctx {};
+    struct combine_memory_region_info_t *combine_mr_info_d = nullptr;
 
     void exchange_remote_rdma_info(remote_info* dst, remote_info *src, int num_of_qps);
 };
+
+#endif  // !USE_NIXL

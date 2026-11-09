@@ -151,6 +151,7 @@ def get_extension_hybrid_ep_cpp():
 
     sources = [
         "csrc/hybrid_ep/hybrid_ep.cu",
+        "csrc/hybrid_ep/buffer/intranode.cu",
         "csrc/hybrid_ep/allocator/allocator.cu",
         "csrc/hybrid_ep/jit/compiler.cu",
         "csrc/hybrid_ep/executor/executor.cu",
@@ -183,9 +184,14 @@ def get_extension_hybrid_ep_cpp():
         os.path.join(current_dir, "deep_ep/backend/"),
         dirs_exist_ok=True
     )
-    # Add inter-node dependency 
+    # The backend headers include "utils.cuh", which lives one level up
+    shutil.copy(
+        os.path.join(current_dir, "csrc/hybrid_ep/utils.cuh"),
+        os.path.join(current_dir, "deep_ep/backend/utils.cuh")
+    )
+    # Add inter-node dependency
     if enable_multinode:
-        sources.extend(["csrc/hybrid_ep/internode.cu"])
+        sources.extend(["csrc/hybrid_ep/buffer/internode_doca.cu"])
         rdma_include_dir, rdma_library_dir = find_rdma_core_paths()
         nccl_dir = os.path.join(current_dir, "third-party/nccl")        
         compile_args["nvcc"].append("-DHYBRID_EP_BUILD_MULTINODE_ENABLE")
