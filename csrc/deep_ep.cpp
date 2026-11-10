@@ -130,6 +130,7 @@ Buffer::Buffer(int rank,
                int num_ranks,
                int64_t num_nvl_bytes,
                int64_t num_rdma_bytes,
+               int64_t num_replica_bytes,
                bool low_latency_mode,
                bool explicitly_destroy,
                bool enable_shrink,
@@ -153,7 +154,9 @@ Buffer::Buffer(int rank,
               reinterpret_cast<paddle::distributed::ProcessGroupNCCL*>(pg)->GetDeviceContext(place, true));
           return at::cuda::getStreamFromExternal(comm_ctx->GetStream(), device_id);
       }()),
-      shared_memory_allocator(use_fabric) {
+      shared_memory_allocator(use_fabric),
+      num_replica_bytes(num_replica_bytes),
+      replica_memory_allocator(use_fabric) {
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
@@ -203,6 +206,14 @@ Buffer::Buffer(int rank,
 
         // No need to synchronize, will do a full device sync during `sync`
         CUDA_CHECK(cudaMemsetAsync(barrier_signal_ptrs[nvl_rank], 0, barrier_signal_bytes, comm_stream));
+    }
+
+    // Replica buffer: alloc local memory and set local IPC handles
+    EP_HOST_ASSERT(num_replica_bytes >= 0 and num_replica_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0);
+    if (num_replica_bytes > 0) {
+        EP_HOST_ASSERT(num_nvl_bytes > 0 and "Replica buffer requires the NVL buffer for barriers");
+        replica_memory_allocator.malloc(&replica_buffer_ptrs[nvl_rank], num_replica_bytes);
+        replica_memory_allocator.get_mem_handle(&replica_ipc_handles[nvl_rank], replica_buffer_ptrs[nvl_rank]);
     }
 
     // Create 32 MiB workspace
@@ -306,9 +317,16 @@ void Buffer::destroy() {
                 if (i != nvl_rank)
                     shared_memory_allocator.close_mem_handle(buffer_ptrs[i]);
         }
+        if (num_replica_bytes > 0) {
+            for (int i = 0; i < num_nvl_ranks; ++i)
+                if (i != nvl_rank)
+                    replica_memory_allocator.close_mem_handle(replica_buffer_ptrs[i]);
+        }
 
         // Free local buffer and error flag
         shared_memory_allocator.free(buffer_ptrs[nvl_rank]);
+        if (num_replica_bytes > 0)
+            replica_memory_allocator.free(replica_buffer_ptrs[nvl_rank]);
     }
 
     // Free NVSHMEM
@@ -339,6 +357,7 @@ void Buffer::destroy() {
 
 void Buffer::sync(const std::vector<int>& device_ids,
                   const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
+                  const std::vector<std::optional<pybind11::bytearray>>& all_gathered_replica_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
     EP_HOST_ASSERT(not is_available());
 
@@ -363,6 +382,22 @@ void Buffer::sync(const std::vector<int>& device_ids,
         CUDA_CHECK(cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs, sizeof(void*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    // Sync replica buffer IPC handles
+    if (num_replica_bytes > 0) {
+        EP_HOST_ASSERT(num_ranks == all_gathered_replica_handles.size());
+        for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
+            EP_HOST_ASSERT(all_gathered_replica_handles[offset + i].has_value());
+            auto handle_str = std::string(all_gathered_replica_handles[offset + i].value());
+            EP_HOST_ASSERT(handle_str.size() == shared_memory::HANDLE_SIZE);
+            if (offset + i != rank) {
+                std::memcpy(&replica_ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE);
+                replica_memory_allocator.open_mem_handle(&replica_buffer_ptrs[i], &replica_ipc_handles[i]);
+            } else {
+                EP_HOST_ASSERT(std::memcmp(&replica_ipc_handles[i], handle_str.c_str(), shared_memory::HANDLE_SIZE) == 0);
+            }
+        }
     }
 
     // Sync NVSHMEM handles and allocate memory
@@ -402,6 +437,190 @@ void Buffer::sync(const std::vector<int>& device_ids,
 
     // Ready to use
     available = true;
+}
+
+pybind11::bytearray Buffer::get_local_replica_ipc_handle() const {
+    EP_HOST_ASSERT(num_replica_bytes > 0);
+    const shared_memory::MemHandle& handle = replica_ipc_handles[nvl_rank];
+    return {reinterpret_cast<const char*>(&handle), sizeof(handle)};
+}
+
+Buffer::ReplicaLayout Buffer::get_replica_layout(int num_replicas, int hidden, int intermediate) const {
+    EP_HOST_ASSERT(0 <= num_replicas and num_replicas <= intranode::kMaxReplicasPerRank);
+    EP_HOST_ASSERT(hidden > 0 and intermediate > 0);
+
+    // In BF16 bytes
+    ReplicaLayout layout;
+    layout.num_w1_bytes_per_expert = static_cast<int64_t>(hidden) * 2 * intermediate * 2;
+    layout.num_w2_bytes_per_expert = static_cast<int64_t>(intermediate) * hidden * 2;
+    layout.w1_offset = 0;
+    layout.w2_offset = layout.w1_offset + num_replicas * layout.num_w1_bytes_per_expert;
+    layout.w1_grad_offset = layout.w2_offset + num_replicas * layout.num_w2_bytes_per_expert;
+    layout.w2_grad_offset = layout.w1_grad_offset + num_replicas * layout.num_w1_bytes_per_expert * 2;
+    const auto num_bytes = layout.w2_grad_offset + num_replicas * layout.num_w2_bytes_per_expert * 2;
+    EP_HOST_ASSERT(num_bytes <= num_replica_bytes and "Replica buffer is too small, enlarge it in `get_buffer`");
+    return layout;
+}
+
+void Buffer::check_physical_to_logical_map(const torch::Tensor& physical_to_logical_map, int num_local_experts, int num_replicas) const {
+    EP_HOST_ASSERT(physical_to_logical_map.dim() == 1 and physical_to_logical_map.is_contiguous());
+    EP_HOST_ASSERT(physical_to_logical_map.scalar_type() == torch::kInt32);
+    EP_HOST_ASSERT(num_local_experts > 0);
+    EP_HOST_ASSERT(physical_to_logical_map.size(0) == static_cast<int64_t>(num_ranks) * (num_local_experts + num_replicas) and
+                   "The map does not match `num_local_experts` and `num_replicas`");
+}
+
+std::tuple<std::vector<torch::Tensor>, std::optional<EventHandle>>
+Buffer::weight_sync(const torch::Tensor& physical_to_logical_map,
+                    const std::vector<torch::Tensor>& master,
+                    int num_replicas,
+                    int hidden,
+                    int intermediate,
+                    int num_sms,
+                    std::optional<EventHandle>& previous_event,
+                    bool async) {
+    // BF16: `[w1, w2]`, FP8: `[w1, w1_scale, w2, w2_scale]` with scales in their physical (transposed) layout
+    EP_HOST_ASSERT(master.size() == 2 or master.size() == 4);
+    EP_HOST_ASSERT(num_sms > 0);
+    const bool use_fp8 = master.size() == 4;
+    const auto layout = get_replica_layout(num_replicas, hidden, intermediate);
+    const auto num_local_experts = static_cast<int>(master[0].size(0));
+    check_physical_to_logical_map(physical_to_logical_map, num_local_experts, num_replicas);
+
+    // Destination offset and the max bytes per expert of each tensor
+    int64_t replica_offsets[4], max_bytes_per_expert[4];
+    if (use_fp8) {
+        const auto w1_fp8_bytes = layout.num_w1_bytes_per_expert / 2, w2_fp8_bytes = layout.num_w2_bytes_per_expert / 2;
+        replica_offsets[0] = layout.w1_offset, max_bytes_per_expert[0] = w1_fp8_bytes;
+        replica_offsets[1] = layout.w1_offset + num_replicas * w1_fp8_bytes, max_bytes_per_expert[1] = w1_fp8_bytes;
+        replica_offsets[2] = layout.w2_offset, max_bytes_per_expert[2] = w2_fp8_bytes;
+        replica_offsets[3] = layout.w2_offset + num_replicas * w2_fp8_bytes, max_bytes_per_expert[3] = w2_fp8_bytes;
+    } else {
+        replica_offsets[0] = layout.w1_offset, max_bytes_per_expert[0] = layout.num_w1_bytes_per_expert;
+        replica_offsets[1] = layout.w2_offset, max_bytes_per_expert[1] = layout.num_w2_bytes_per_expert;
+    }
+
+    intranode::WeightSyncArgs args = {};
+    args.num_tensors = static_cast<int>(master.size());
+    args.num_local_experts = num_local_experts;
+    args.num_replicas = num_replicas;
+    args.rank = rank;
+    args.nvl_rank_offset = rdma_rank * NUM_MAX_NVL_PEERS;
+    for (int i = 0; i < num_nvl_ranks; ++i)
+        args.replica_ptrs[i] = replica_buffer_ptrs[i];
+
+    // Replica tensors are views of the local replica buffer, each shaped as `[num_replicas, ...]`
+    std::vector<torch::Tensor> replica;
+    for (int i = 0; i < args.num_tensors; ++i) {
+        const auto& t = master[i];
+        EP_HOST_ASSERT(t.is_contiguous() and t.dim() >= 1 and t.size(0) == num_local_experts);
+        EP_HOST_ASSERT(reinterpret_cast<uint64_t>(t.data_ptr()) % 16 == 0);
+        const auto num_bytes_per_expert = t.numel() / num_local_experts * t.element_size();
+        const bool is_data = not use_fp8 or i % 2 == 0;
+        // Weights must exactly match the layout, while FP8 scales only need to fit into their half
+        EP_HOST_ASSERT(is_data ? num_bytes_per_expert == max_bytes_per_expert[i] : num_bytes_per_expert <= max_bytes_per_expert[i]);
+        EP_HOST_ASSERT(not use_fp8 or (is_data ? t.element_size() == 1 : t.element_size() == 4));
+        args.master[i] = t.data_ptr();
+        args.num_bytes_per_expert[i] = num_bytes_per_expert;
+        args.replica_offsets[i] = replica_offsets[i];
+
+        std::vector<int64_t> sizes(t.sizes().begin(), t.sizes().end());
+        sizes[0] = num_replicas;
+        replica.push_back(torch::from_blob(static_cast<uint8_t*>(replica_buffer_ptrs[nvl_rank]) + replica_offsets[i], sizes, t.options()));
+    }
+
+    // Wait previous tasks to be finished
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    if (previous_event.has_value()) {
+        stream_wait(comm_stream, previous_event.value());
+    } else {
+        stream_wait(comm_stream, compute_stream);
+    }
+
+    if (num_replicas > 0) {
+        // The kernel ends with a barrier across ranks, so local replicas are complete once it finishes
+        args.barrier_signal_ptrs = barrier_signal_ptrs_gpu;
+        intranode::weight_sync(physical_to_logical_map.data_ptr<int>(), args, num_nvl_ranks, comm_stream, num_sms);
+    }
+
+    // Wait streams
+    std::optional<EventHandle> event;
+    if (async)
+        event = EventHandle(comm_stream);
+    else
+        stream_wait(compute_stream, comm_stream);
+
+    return {replica, event};
+}
+
+std::vector<torch::Tensor> Buffer::get_replica_grads(int num_replicas, int hidden, int intermediate) {
+    const auto layout = get_replica_layout(num_replicas, hidden, intermediate);
+    const auto base_ptr = static_cast<uint8_t*>(replica_buffer_ptrs[nvl_rank]);
+    const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    const std::vector<int64_t> w1_sizes = {num_replicas, hidden, 2 * intermediate};
+    const std::vector<int64_t> w2_sizes = {num_replicas, intermediate, hidden};
+    return {torch::from_blob(base_ptr + layout.w1_grad_offset, w1_sizes, options),
+            torch::from_blob(base_ptr + layout.w2_grad_offset, w2_sizes, options)};
+}
+
+std::optional<EventHandle>
+Buffer::grad_reduce(const torch::Tensor& physical_to_logical_map,
+                    const std::vector<torch::Tensor>& master_grad,
+                    int num_replicas,
+                    int hidden,
+                    int intermediate,
+                    int num_sms,
+                    std::optional<EventHandle>& previous_event,
+                    bool async) {
+    // `[w1_grad, w2_grad]` in FP32
+    EP_HOST_ASSERT(master_grad.size() == 2);
+    EP_HOST_ASSERT(num_sms > 0);
+    const auto layout = get_replica_layout(num_replicas, hidden, intermediate);
+    const auto num_local_experts = static_cast<int>(master_grad[0].size(0));
+    check_physical_to_logical_map(physical_to_logical_map, num_local_experts, num_replicas);
+
+    intranode::GradReduceArgs args = {};
+    args.num_tensors = 2;
+    args.num_local_experts = num_local_experts;
+    args.num_replicas = num_replicas;
+    args.rank = rank;
+    args.nvl_rank_offset = rdma_rank * NUM_MAX_NVL_PEERS;
+    args.replica_offsets[0] = layout.w1_grad_offset;
+    args.replica_offsets[1] = layout.w2_grad_offset;
+    const int64_t num_bytes_per_expert[2] = {layout.num_w1_bytes_per_expert * 2, layout.num_w2_bytes_per_expert * 2};
+    for (int i = 0; i < 2; ++i) {
+        const auto& t = master_grad[i];
+        EP_HOST_ASSERT(t.scalar_type() == torch::kFloat32 and t.is_contiguous());
+        EP_HOST_ASSERT(t.dim() >= 1 and t.size(0) == num_local_experts);
+        EP_HOST_ASSERT(t.numel() / num_local_experts * t.element_size() == num_bytes_per_expert[i]);
+        EP_HOST_ASSERT(reinterpret_cast<uint64_t>(t.data_ptr()) % 16 == 0);
+        args.master_grad[i] = t.data_ptr<float>();
+        args.num_bytes_per_expert[i] = num_bytes_per_expert[i];
+    }
+    for (int i = 0; i < num_nvl_ranks; ++i)
+        args.replica_ptrs[i] = replica_buffer_ptrs[i];
+
+    // Wait previous tasks to be finished
+    auto compute_stream = at::cuda::getStreamFromExternal(calc_ctx->stream(), device_id);
+    if (previous_event.has_value()) {
+        stream_wait(comm_stream, previous_event.value());
+    } else {
+        stream_wait(comm_stream, compute_stream);
+    }
+
+    if (num_replicas > 0) {
+        args.barrier_signal_ptrs = barrier_signal_ptrs_gpu;
+        intranode::grad_reduce(physical_to_logical_map.data_ptr<int>(), args, num_nvl_ranks, comm_stream, num_sms);
+    }
+
+    // Wait streams
+    std::optional<EventHandle> event;
+    if (async)
+        event = EventHandle(comm_stream);
+    else
+        stream_wait(compute_stream, comm_stream);
+
+    return event;
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
@@ -2026,7 +2245,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("synchronize", &deep_ep::EventHandle::synchronize);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer", py::module_local())
-        .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool, int>())
+        .def(pybind11::init<int, int, int64_t, int64_t, int64_t, bool, bool, bool, bool, int>())
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
@@ -2045,6 +2264,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #endif
            })
         .def("sync", &deep_ep::Buffer::sync)
+        .def("get_local_replica_ipc_handle", &deep_ep::Buffer::get_local_replica_ipc_handle)
+        .def("weight_sync", &deep_ep::Buffer::weight_sync)
+        .def("get_replica_grads", &deep_ep::Buffer::get_replica_grads)
+        .def("grad_reduce", &deep_ep::Buffer::grad_reduce)
         .def("destroy", &deep_ep::Buffer::destroy)
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)

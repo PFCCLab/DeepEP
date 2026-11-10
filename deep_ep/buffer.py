@@ -33,6 +33,7 @@ class Buffer:
                  group: Optional[Group],
                  num_nvl_bytes: int = 0,
                  num_rdma_bytes: int = 0,
+                 num_replica_bytes: int = 0,
                  low_latency_mode: bool = False,
                  num_qps_per_rank: int = 24,
                  allow_nvlink_for_low_latency_mode: bool = True,
@@ -48,6 +49,7 @@ class Buffer:
             group: the communication group.
             num_nvl_bytes: the buffer size for intranode NVLink communication.
             num_rdma_bytes: the buffer size for internode (also for intranode with low-latency mode) RDMA communication.
+            num_replica_bytes: the buffer size for UltraEP replica experts, 0 to disable.
             low_latency_mode: whether to enable low-latency mode.
             num_qps_per_rank: the number of QPs for RDMA, the low-latency mode requires that this number equals
                 to the number of local experts.
@@ -85,11 +87,12 @@ class Buffer:
             raise ValueError("Either 'group' or 'comm' must be provided.")
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
+        self.num_replica_bytes = num_replica_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
-        self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
-                                          enable_shrink, use_fabric, group.id)
+        self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, num_replica_bytes, low_latency_mode,
+                                          explicitly_destroy, enable_shrink, use_fabric, group.id)
 
         # Synchronize device IDs
         device_ids = []
@@ -100,6 +103,12 @@ class Buffer:
         ipc_handles = []
         local_ipc_handle = self.runtime.get_local_ipc_handle()
         dist.all_gather_object(ipc_handles, local_ipc_handle, group)
+
+        # Synchronize replica buffer IPC handles
+        replica_ipc_handles = []
+        if num_replica_bytes > 0:
+            local_replica_ipc_handle = self.runtime.get_local_replica_ipc_handle()
+            dist.all_gather_object(replica_ipc_handles, local_replica_ipc_handle, group)
 
         # Synchronize NVSHMEM unique IDs
         root_unique_id = None
@@ -135,7 +144,7 @@ class Buffer:
             root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
 
         # Make CPP runtime available
-        self.runtime.sync(device_ids, ipc_handles, root_unique_id)
+        self.runtime.sync(device_ids, ipc_handles, replica_ipc_handles, root_unique_id)
         assert self.runtime.is_available()
 
     def destroy(self):
@@ -320,6 +329,80 @@ class Buffer:
             self.runtime.get_dispatch_layout(topk_idx, num_experts, getattr(previous_event, 'event', None),
                                              async_finish, allocate_on_comm_stream)
         return num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, EventOverlap(event)
+
+    def weight_sync(self, physical_to_logical_map: torch.Tensor, master: List[torch.Tensor],
+                    num_replicas: int, hidden: int, intermediate: int, num_sms: int,
+                    previous_event: Optional[EventOverlap] = None, async_finish: bool = False) -> \
+            Tuple[List[torch.Tensor], Optional[EventOverlap]]:
+        """
+        Push local master experts into the replica slots of intranode peers, using TMA copies over NVLink.
+        The kernel runs on the communication stream, and the current stream waits until all local replicas are received.
+
+        The replica buffer is sliced per call by `(num_replicas, hidden, intermediate)`, so layers may differ:
+            `w1 [R, H, 2I]`, `w2 [R, I, H]` in BF16 bytes (FP8 data in the first half, scales at the start of the second
+            half), then `w1_grad`, `w2_grad` in FP32. Results are only valid until the next call with another layout.
+
+        Arguments:
+            physical_to_logical_map: `[num_ranks * (num_local_experts + num_replicas)]`, the logical expert of each
+                physical slot, `-1` means an empty replica slot.
+            master: BF16 `[w1, w2]`, or FP8 `[w1, w1_scale, w2, w2_scale]` where the scales are passed in their physical
+                (transposed) layout, e.g. `scale.mT`. Each is contiguous and shaped as `[num_local_experts, ...]`.
+            num_replicas: the number of replica experts per rank.
+            hidden: the hidden size `H` of the experts.
+            intermediate: the intermediate size `I` of the experts.
+            num_sms: the number of SMs used by the copy kernel.
+            previous_event: the event to wait before actually executing the kernel, the current stream is waited if not set.
+            async_finish: the current stream will not wait for the communication kernels to be finished if set.
+
+        Returns:
+            replica: views of the local replica buffer, each shaped as `[num_replicas, ...]` like `master`, empty slots
+                are undefined.
+            event: the event after executing the kernel (valid only if `async_finish` is set).
+        """
+        return self.runtime.weight_sync(physical_to_logical_map, master, num_replicas, hidden, intermediate, num_sms,
+                                        getattr(previous_event, 'event', None), async_finish)
+
+    def get_replica_grads(self, num_replicas: int, hidden: int, intermediate: int) -> List[torch.Tensor]:
+        """
+        Get the replica grads `[w1_grad [R, H, 2I], w2_grad [R, I, H]]` in FP32 as views of the local replica buffer,
+        sliced with the same layout as `weight_sync`. The wgrad of replica experts should be written (or accumulated)
+        into them. They are not cleared by `grad_reduce`: call `zero_()` in each layer before its wgrad, somewhere
+        overlappable, but only after the next DeepEP barrier (e.g. the next `dispatch`) since peers read them in
+        `grad_reduce`.
+
+        Arguments:
+            num_replicas: the number of replica experts per rank.
+            hidden: the hidden size `H` of the experts.
+            intermediate: the intermediate size `I` of the experts.
+
+        Returns:
+            replica_grad: FP32 views of the local replica buffer.
+        """
+        return self.runtime.get_replica_grads(num_replicas, hidden, intermediate)
+
+    def grad_reduce(self, physical_to_logical_map: torch.Tensor, master_grad: List[torch.Tensor],
+                    num_replicas: int, hidden: int, intermediate: int, num_sms: int,
+                    previous_event: Optional[EventOverlap] = None, async_finish: bool = False) -> Optional[EventOverlap]:
+        """
+        Read replica grads of local master experts from intranode peers over NVLink, and accumulate them into
+        `master_grad` in-place, in the same order as `grad_sync` + `accumulate_wgrad_`.
+        The kernel runs on the communication stream, and the current stream waits until the accumulation is done.
+
+        Arguments:
+            physical_to_logical_map: the same map as `weight_sync`.
+            master_grad: `[w1_grad, w2_grad]` in FP32, each contiguous and shaped as `[num_local_experts, ...]`.
+            num_replicas: the number of replica experts per rank.
+            hidden: the hidden size `H` of the experts.
+            intermediate: the intermediate size `I` of the experts.
+            num_sms: the number of SMs used by the reduce kernel.
+            previous_event: the event to wait before actually executing the kernel, the current stream is waited if not set.
+            async_finish: the current stream will not wait for the communication kernels to be finished if set.
+
+        Returns:
+            event: the event after executing the kernel (valid only if `async_finish` is set).
+        """
+        return self.runtime.grad_reduce(physical_to_logical_map, master_grad, num_replicas, hidden, intermediate, num_sms,
+                                        getattr(previous_event, 'event', None), async_finish)
 
     # noinspection PyTypeChecker
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],

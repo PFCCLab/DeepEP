@@ -1,8 +1,10 @@
+#include "api.cuh"
 #include "buffer.cuh"
 #include "configs.cuh"
 #include "exception.cuh"
 #include "launch.cuh"
 #include "utils.cuh"
+#include <cooperative_groups.h>
 
 namespace deep_ep {
 
@@ -1096,6 +1098,298 @@ void combine(cudaDataType_t type,
     SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE);
 #undef COMBINE_DTYPE_LAUNCH_CASE
 #undef COMBINE_LAUNCH_CASE
+}
+
+template <int kNumRanks, int kNumWarps, int kNumStages, int kNumChunkBytes>
+__global__ void __launch_bounds__(kNumWarps * 32, 1) weight_sync(const int* physical_to_logical_map, const WeightSyncArgs args) {
+    const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32;
+    const auto nvl_rank = args.rank - args.nvl_rank_offset;
+    const auto num_physical_experts = args.num_local_experts + args.num_replicas;
+
+    // Collect the replica slots in this node that hold one of our master experts
+    // NOTES: every block builds the same list, so no inter-block communication is needed
+    __shared__ int num_items;
+    __shared__ int item_dst_rank[kNumRanks * kMaxReplicasPerRank];
+    __shared__ int item_replica_idx[kNumRanks * kMaxReplicasPerRank];
+    __shared__ int item_master_idx[kNumRanks * kMaxReplicasPerRank];
+    if (thread_id == 0) {
+        int count = 0;
+        for (int i = 0; i < kNumRanks; ++i) {
+            const auto replica_base = (args.nvl_rank_offset + i) * num_physical_experts + args.num_local_experts;
+            for (int j = 0; j < args.num_replicas; ++j) {
+                const auto logical_idx = __ldg(physical_to_logical_map + replica_base + j);
+                if (logical_idx >= 0 and logical_idx / args.num_local_experts == args.rank) {
+                    item_dst_rank[count] = i;
+                    item_replica_idx[count] = j;
+                    item_master_idx[count] = logical_idx - args.rank * args.num_local_experts;
+                    ++count;
+                }
+            }
+        }
+        num_items = count;
+    }
+
+    // Each warp owns `kNumStages` TMA buffers and their mbarriers
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    auto tma_buffer = smem_buffer + warp_id * kNumStages * kNumChunkBytes;
+    auto tma_mbarriers = reinterpret_cast<uint64_t*>(smem_buffer + kNumWarps * kNumStages * kNumChunkBytes) + warp_id * kNumStages;
+    uint32_t tma_phase = 0;
+    if (elect_one_sync()) {
+        #pragma unroll
+        for (int i = 0; i < kNumStages; ++i)
+            mbarrier_init(tma_mbarriers + i, 1);
+        fence_barrier_init();
+    }
+    __syncthreads();
+
+    // Interleave items so that all destinations are fed concurrently, and start from a rank-dependent item
+    // to avoid every sender hitting the same receiver
+    const auto num_chunks_per_item = args.chunk_prefix[args.num_tensors];
+    const auto num_chunks = static_cast<int64_t>(num_items) * num_chunks_per_item;
+    const auto num_global_warps = static_cast<int64_t>(gridDim.x) * kNumWarps;
+    int iter = 0;
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * kNumWarps + warp_id; idx < num_chunks; idx += num_global_warps, ++iter) {
+        const auto item = static_cast<int>((idx + nvl_rank) % num_items);
+        const auto chunk_idx = static_cast<int>(idx / num_items);
+        int tensor_idx = 0;
+        while (chunk_idx >= args.chunk_prefix[tensor_idx + 1])
+            ++tensor_idx;
+
+        const auto num_bytes_per_expert = args.num_bytes_per_expert[tensor_idx];
+        const auto offset = static_cast<int64_t>(chunk_idx - args.chunk_prefix[tensor_idx]) * kNumChunkBytes;
+        const auto num_bytes = static_cast<int>(min(static_cast<int64_t>(kNumChunkBytes), num_bytes_per_expert - offset));
+        const auto src = static_cast<const uint8_t*>(args.master[tensor_idx]) + item_master_idx[item] * num_bytes_per_expert + offset;
+        const auto dst = static_cast<uint8_t*>(args.replica_ptrs[item_dst_rank[item]]) + args.replica_offsets[tensor_idx] +
+            item_replica_idx[item] * num_bytes_per_expert + offset;
+
+        const auto stage_idx = iter % kNumStages;
+        if (elect_one_sync()) {
+            // Make sure the store issued `kNumStages` iterations ago has released this stage
+            tma_store_wait<kNumStages - 1>();
+            tma_load_1d(tma_buffer + stage_idx * kNumChunkBytes, src, tma_mbarriers + stage_idx, num_bytes);
+            mbarrier_arrive_and_expect_tx(tma_mbarriers + stage_idx, num_bytes);
+            mbarrier_wait<true>(tma_mbarriers + stage_idx, tma_phase, stage_idx);
+            tma_store_1d(tma_buffer + stage_idx * kNumChunkBytes, dst, num_bytes, false);
+        }
+        __syncwarp();
+    }
+
+    // Wait for the remote writes to land
+    if (elect_one_sync()) {
+        tma_store_wait_complete<0>();
+        memory_fence();
+    }
+
+    // Block 0 publishes all writes to the receivers with a barrier across ranks
+    const auto group = cooperative_groups::this_grid();
+    cooperative_groups::sync(group);
+    if (blockIdx.x == 0)
+        barrier_block<kNumRanks>(args.barrier_signal_ptrs, nvl_rank);
+}
+
+void weight_sync(const int* physical_to_logical_map, WeightSyncArgs args, int num_nvl_ranks, cudaStream_t stream, int num_sms) {
+    constexpr int kNumWarps = 8;
+    constexpr int kNumStages = 3;
+    constexpr int kNumChunkBytes = 8192;
+    constexpr int smem_size = kNumWarps * kNumStages * (kNumChunkBytes + static_cast<int>(sizeof(uint64_t)));
+
+    EP_HOST_ASSERT(0 < args.num_tensors and args.num_tensors <= kMaxWeightSyncTensors);
+    EP_HOST_ASSERT(0 <= args.num_replicas and args.num_replicas <= kMaxReplicasPerRank);
+    args.chunk_prefix[0] = 0;
+    for (int i = 0; i < args.num_tensors; ++i) {
+        EP_HOST_ASSERT(args.num_bytes_per_expert[i] % 16 == 0);
+        const auto num_chunks = ceil_div<int64_t>(args.num_bytes_per_expert[i], kNumChunkBytes);
+        EP_HOST_ASSERT(args.chunk_prefix[i] + num_chunks < std::numeric_limits<int>::max());
+        args.chunk_prefix[i + 1] = args.chunk_prefix[i] + static_cast<int>(num_chunks);
+    }
+
+    const auto num_ranks = num_nvl_ranks;
+#define WEIGHT_SYNC_LAUNCH_CASE(ranks)                                                  \
+    {                                                                                   \
+        auto kernel = weight_sync<ranks, kNumWarps, kNumStages, kNumChunkBytes>;        \
+        SET_SHARED_MEMORY_FOR_TMA(kernel);                                              \
+        LAUNCH_KERNEL(&cfg, kernel, physical_to_logical_map, args);                     \
+    }                                                                                   \
+    break
+
+    SETUP_LAUNCH_CONFIG(num_sms, kNumWarps * 32, stream);
+    SWITCH_RANKS(WEIGHT_SYNC_LAUNCH_CASE);
+#undef WEIGHT_SYNC_LAUNCH_CASE
+}
+
+template <int kNumRanks, int kNumWarps, int kNumStages, int kNumChunkBytes>
+__global__ void __launch_bounds__(kNumWarps * 32, 1) grad_reduce(const int* physical_to_logical_map, const GradReduceArgs args) {
+    constexpr int kNumChunkFloat4 = kNumChunkBytes / static_cast<int>(sizeof(float4));
+    constexpr int kNumFloat4PerLane = kNumChunkFloat4 / 32;
+    EP_STATIC_ASSERT(kNumChunkFloat4 % 32 == 0, "Invalid chunk size");
+
+    const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
+    const auto nvl_rank = args.rank - args.nvl_rank_offset;
+    const auto num_physical_experts = args.num_local_experts + args.num_replicas;
+
+    // Group the replica slots in this node by our master experts, sources are in (rank, slot) order
+    // NOTES: every block builds the same list, so no inter-block communication is needed
+    constexpr int kMaxSources = kNumRanks * kMaxReplicasPerRank;
+    __shared__ int num_items;
+    __shared__ int item_master_idx[kMaxSources];
+    __shared__ int item_source_begin[kMaxSources + 1];
+    __shared__ int source_rank[kMaxSources];
+    __shared__ int source_replica_idx[kMaxSources];
+    if (thread_id == 0) {
+        int count = 0, num_sources = 0;
+        for (int m = 0; m < args.num_local_experts; ++m) {
+            const auto begin = num_sources;
+            for (int i = 0; i < kNumRanks; ++i) {
+                const auto replica_base = (args.nvl_rank_offset + i) * num_physical_experts + args.num_local_experts;
+                for (int j = 0; j < args.num_replicas; ++j) {
+                    if (__ldg(physical_to_logical_map + replica_base + j) == args.rank * args.num_local_experts + m) {
+                        source_rank[num_sources] = i;
+                        source_replica_idx[num_sources] = j;
+                        ++num_sources;
+                    }
+                }
+            }
+            if (num_sources > begin) {
+                item_master_idx[count] = m;
+                item_source_begin[count] = begin;
+                ++count;
+            }
+        }
+        item_source_begin[count] = num_sources;
+        num_items = count;
+    }
+
+    // Wait until every rank has finished writing its replica grads
+    if (blockIdx.x == 0)
+        barrier_block<kNumRanks>(args.barrier_signal_ptrs, nvl_rank);
+    const auto group = cooperative_groups::this_grid();
+    cooperative_groups::sync(group);
+
+    // Each warp owns `kNumStages` TMA buffers and their mbarriers
+    extern __shared__ __align__(1024) uint8_t smem_buffer[];
+    auto tma_buffer = smem_buffer + warp_id * kNumStages * kNumChunkBytes;
+    auto tma_mbarriers = reinterpret_cast<uint64_t*>(smem_buffer + kNumWarps * kNumStages * kNumChunkBytes) + warp_id * kNumStages;
+    uint32_t tma_phase = 0;
+    if (elect_one_sync()) {
+        #pragma unroll
+        for (int i = 0; i < kNumStages; ++i)
+            mbarrier_init(tma_mbarriers + i, 1);
+        fence_barrier_init();
+    }
+    __syncthreads();
+
+    // A unit is one chunk of one master, which reads one chunk from each of its sources
+    // NOTES: units are interleaved across masters and start from a rank-dependent item, like `weight_sync`
+    const auto num_chunks_per_item = args.chunk_prefix[args.num_tensors];
+    const auto num_units = static_cast<int64_t>(num_items) * num_chunks_per_item;
+    const auto unit_stride = static_cast<int64_t>(gridDim.x) * kNumWarps;
+    const auto first_unit = static_cast<int64_t>(blockIdx.x) * kNumWarps + warp_id;
+    const auto get_item = [&](int64_t unit) { return static_cast<int>((unit + nvl_rank) % num_items); };
+    const auto get_num_sources = [&](int64_t unit) {
+        const auto item = get_item(unit);
+        return item_source_begin[item + 1] - item_source_begin[item];
+    };
+    const auto decode = [&](int64_t unit, int& tensor_idx, int64_t& offset, int& num_bytes) {
+        const auto chunk_idx = static_cast<int>(unit / num_items);
+        tensor_idx = 0;
+        while (chunk_idx >= args.chunk_prefix[tensor_idx + 1])
+            ++tensor_idx;
+        offset = static_cast<int64_t>(chunk_idx - args.chunk_prefix[tensor_idx]) * kNumChunkBytes;
+        num_bytes = static_cast<int>(min(static_cast<int64_t>(kNumChunkBytes), args.num_bytes_per_expert[tensor_idx] - offset));
+    };
+
+    // Loads are issued in the same (unit, source) order as they are consumed, keeping `kNumStages` in flight
+    int64_t issue_unit = first_unit;
+    int issue_source = 0;
+    const auto issue_next = [&](int stage_idx) {
+        if (lane_id == 0) {
+            int tensor_idx, num_bytes;
+            int64_t offset;
+            decode(issue_unit, tensor_idx, offset, num_bytes);
+            const auto source_idx = item_source_begin[get_item(issue_unit)] + issue_source;
+            const auto src = static_cast<const uint8_t*>(args.replica_ptrs[source_rank[source_idx]]) + args.replica_offsets[tensor_idx] +
+                source_replica_idx[source_idx] * args.num_bytes_per_expert[tensor_idx] + offset;
+            tma_load_1d(tma_buffer + stage_idx * kNumChunkBytes, src, tma_mbarriers + stage_idx, num_bytes);
+            mbarrier_arrive_and_expect_tx(tma_mbarriers + stage_idx, num_bytes);
+        }
+        if (++issue_source == get_num_sources(issue_unit))
+            issue_source = 0, issue_unit += unit_stride;
+    };
+    for (int i = 0; i < kNumStages and issue_unit < num_units; ++i)
+        issue_next(i);
+
+    int stage_idx = 0;
+    for (int64_t unit = first_unit; unit < num_units; unit += unit_stride) {
+        int tensor_idx, num_bytes;
+        int64_t offset;
+        decode(unit, tensor_idx, offset, num_bytes);
+        const auto num_float4 = num_bytes / static_cast<int>(sizeof(float4));
+        const auto master_ptr = reinterpret_cast<float4*>(reinterpret_cast<uint8_t*>(args.master_grad[tensor_idx]) +
+                                                          item_master_idx[get_item(unit)] * args.num_bytes_per_expert[tensor_idx] + offset);
+
+        // Same summation order as `accumulate_wgrad_`: master first, then sources one by one
+        float4 acc[kNumFloat4PerLane];
+        #pragma unroll
+        for (int i = 0; i < kNumFloat4PerLane; ++i)
+            if (lane_id + i * 32 < num_float4)
+                acc[i] = master_ptr[lane_id + i * 32];
+
+        for (int k = 0, num_sources = get_num_sources(unit); k < num_sources; ++k) {
+            mbarrier_wait<true>(tma_mbarriers + stage_idx, tma_phase, stage_idx);
+            const auto smem_ptr = reinterpret_cast<const float4*>(tma_buffer + stage_idx * kNumChunkBytes);
+            #pragma unroll
+            for (int i = 0; i < kNumFloat4PerLane; ++i) {
+                if (lane_id + i * 32 < num_float4) {
+                    const auto value = smem_ptr[lane_id + i * 32];
+                    acc[i].x += value.x, acc[i].y += value.y, acc[i].z += value.z, acc[i].w += value.w;
+                }
+            }
+
+            // Refill the consumed stage, generic reads must be ordered before the async-proxy writes
+            __syncwarp();
+            if (issue_unit < num_units) {
+                if (lane_id == 0)
+                    tma_store_fence();
+                issue_next(stage_idx);
+            }
+            stage_idx = (stage_idx + 1) % kNumStages;
+        }
+
+        #pragma unroll
+        for (int i = 0; i < kNumFloat4PerLane; ++i)
+            if (lane_id + i * 32 < num_float4)
+                master_ptr[lane_id + i * 32] = acc[i];
+    }
+}
+
+void grad_reduce(const int* physical_to_logical_map, GradReduceArgs args, int num_nvl_ranks, cudaStream_t stream, int num_sms) {
+    constexpr int kNumWarps = 8;
+    constexpr int kNumStages = 3;
+    constexpr int kNumChunkBytes = 8192;
+    constexpr int smem_size = kNumWarps * kNumStages * (kNumChunkBytes + static_cast<int>(sizeof(uint64_t)));
+
+    EP_HOST_ASSERT(0 < args.num_tensors and args.num_tensors <= kMaxWeightSyncTensors);
+    EP_HOST_ASSERT(0 <= args.num_replicas and args.num_replicas <= kMaxReplicasPerRank);
+    args.chunk_prefix[0] = 0;
+    for (int i = 0; i < args.num_tensors; ++i) {
+        EP_HOST_ASSERT(args.num_bytes_per_expert[i] % 16 == 0);
+        const auto num_chunks = ceil_div<int64_t>(args.num_bytes_per_expert[i], kNumChunkBytes);
+        EP_HOST_ASSERT(args.chunk_prefix[i] + num_chunks < std::numeric_limits<int>::max());
+        args.chunk_prefix[i + 1] = args.chunk_prefix[i] + static_cast<int>(num_chunks);
+    }
+
+    const auto num_ranks = num_nvl_ranks;
+#define GRAD_REDUCE_LAUNCH_CASE(ranks)                                                  \
+    {                                                                                   \
+        auto kernel = grad_reduce<ranks, kNumWarps, kNumStages, kNumChunkBytes>;        \
+        SET_SHARED_MEMORY_FOR_TMA(kernel);                                              \
+        LAUNCH_KERNEL(&cfg, kernel, physical_to_logical_map, args);                     \
+    }                                                                                   \
+    break
+
+    SETUP_LAUNCH_CONFIG(num_sms, kNumWarps * 32, stream);
+    SWITCH_RANKS(GRAD_REDUCE_LAUNCH_CASE);
+#undef GRAD_REDUCE_LAUNCH_CASE
 }
 
 }  // namespace intranode

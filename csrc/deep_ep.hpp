@@ -123,11 +123,29 @@ private:
 
     shared_memory::SharedMemoryAllocator shared_memory_allocator;
 
+    // Replica expert buffer, written by remote ranks in `weight_sync`
+    int64_t num_replica_bytes;
+    void* replica_buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
+    shared_memory::MemHandle replica_ipc_handles[NUM_MAX_NVL_PEERS];
+    shared_memory::SharedMemoryAllocator replica_memory_allocator;
+
+    // Per-layer layout of the replica buffer: `w1 [R, H, 2I]`, `w2 [R, I, H]` in BF16 (FP8 data takes the first half
+    // and scales the start of the second half), then `w1_grad`, `w2_grad` in FP32
+    struct ReplicaLayout {
+        int64_t num_w1_bytes_per_expert, num_w2_bytes_per_expert;  // in BF16
+        int64_t w1_offset, w2_offset, w1_grad_offset, w2_grad_offset;
+    };
+
+    ReplicaLayout get_replica_layout(int num_replicas, int hidden, int intermediate) const;
+
+    void check_physical_to_logical_map(const torch::Tensor& physical_to_logical_map, int num_local_experts, int num_replicas) const;
+
 public:
     Buffer(int rank,
            int num_ranks,
            int64_t num_nvl_bytes,
            int64_t num_rdma_bytes,
+           int64_t num_replica_bytes,
            bool low_latency_mode,
            bool explicitly_destroy,
            bool enable_shrink,
@@ -160,7 +178,32 @@ public:
     
     void sync(const std::vector<int>& device_ids,
               const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
+              const std::vector<std::optional<pybind11::bytearray>>& all_gathered_replica_handles,
               const std::optional<pybind11::bytearray>& root_unique_id_opt);
+
+    pybind11::bytearray get_local_replica_ipc_handle() const;
+
+    std::tuple<std::vector<torch::Tensor>, std::optional<EventHandle>> weight_sync(
+        const torch::Tensor& physical_to_logical_map,
+        const std::vector<torch::Tensor>& master,
+        int num_replicas,
+        int hidden,
+        int intermediate,
+        int num_sms,
+        std::optional<EventHandle>& previous_event,
+        bool async);
+
+    std::vector<torch::Tensor> get_replica_grads(int num_replicas, int hidden, int intermediate);
+
+    std::optional<EventHandle> grad_reduce(
+        const torch::Tensor& physical_to_logical_map,
+        const std::vector<torch::Tensor>& master_grad,
+        int num_replicas,
+        int hidden,
+        int intermediate,
+        int num_sms,
+        std::optional<EventHandle>& previous_event,
+        bool async);
 
     void destroy();
 

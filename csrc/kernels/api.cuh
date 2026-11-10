@@ -137,6 +137,51 @@ void combine(cudaDataType_t type,
              int num_max_send_tokens,
              int num_recv_buffer_tokens);
 
+constexpr int kMaxWeightSyncTensors = 8;
+constexpr int kMaxReplicasPerRank = 64;
+
+struct WeightSyncArgs {
+    // Master weights, each shaped as `[num_local_experts, ...]`
+    const void* master[kMaxWeightSyncTensors];
+    int64_t num_bytes_per_expert[kMaxWeightSyncTensors];
+    // Byte offset of each tensor's `[num_replicas, ...]` region inside the replica buffer
+    int64_t replica_offsets[kMaxWeightSyncTensors];
+    // Filled by `weight_sync`: prefix sum of the TMA chunks per expert
+    int chunk_prefix[kMaxWeightSyncTensors + 1];
+    int num_tensors;
+    int num_local_experts;
+    int num_replicas;
+    // Global rank, and the global rank of NVL rank 0 in this node
+    int rank;
+    int nvl_rank_offset;
+    void* replica_ptrs[NUM_MAX_NVL_PEERS];
+    // Barrier across intranode ranks after all copies
+    int** barrier_signal_ptrs;
+};
+
+void weight_sync(const int* physical_to_logical_map, WeightSyncArgs args, int num_nvl_ranks, cudaStream_t stream, int num_sms);
+
+struct GradReduceArgs {
+    // Master grads in FP32, each shaped as `[num_local_experts, ...]`, accumulated in-place
+    float* master_grad[kMaxWeightSyncTensors];
+    int64_t num_bytes_per_expert[kMaxWeightSyncTensors];
+    // Byte offset of each tensor's `[num_replicas, ...]` grad region inside the replica buffer
+    int64_t replica_offsets[kMaxWeightSyncTensors];
+    // Filled by `grad_reduce`: prefix sum of the chunks per expert
+    int chunk_prefix[kMaxWeightSyncTensors + 1];
+    int num_tensors;
+    int num_local_experts;
+    int num_replicas;
+    // Global rank, and the global rank of NVL rank 0 in this node
+    int rank;
+    int nvl_rank_offset;
+    void* replica_ptrs[NUM_MAX_NVL_PEERS];
+    // Barrier across intranode ranks before reading
+    int** barrier_signal_ptrs;
+};
+
+void grad_reduce(const int* physical_to_logical_map, GradReduceArgs args, int num_nvl_ranks, cudaStream_t stream, int num_sms);
+
 }  // namespace intranode
 
 // Internode kernels
