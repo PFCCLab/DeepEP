@@ -2,135 +2,512 @@
 
 > [!NOTE]
 >
-> This repo is a fork of the original DeepEP project, with modifications to enhance compatibility and integration with PaddlePaddle.
+> This repo is a fork of the original DeepEP (V2.5) project, with modifications to enhance
+> compatibility and integration with PaddlePaddle. 
 >
 > **Installation**
 >
 > ```bash
-> pip install paddlepaddle-gpu  # Install PaddlePaddle with GPU support, refer to https://www.paddlepaddle.org.cn/install/quick for more details
-> git clone https://github.com/PFCCLab/DeepEP.git
-> cd DeepEP
-> NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py build
+> # 1. Install PaddlePaddle (GPU) with the torch-compat layer (`paddle.enable_compat`).
+> #    See https://www.paddlepaddle.org.cn/install/quick
+> pip install paddlepaddle-gpu
+>
+> # 2. Clone and initialize the DeepJIT submodule (runtime kernel compilation)
+> git submodule update --init --recursive
+>
+> # 3. DeepEP V2.5 needs NCCL >= 2.32.3 (new GIN device API). If the system NCCL is older,
+> pip install "nvidia-nccl-cu13>=2.32.3" 
+>
+> # 4. Build the extension (uses Paddle's cpp_extension)
+> python setup.py build
 > ```
 >
 > **Usage**
 >
 > ```python
 > import paddle
-> paddle.enable_compat(scope={"deep_ep"})  # Enable torch proxy before importing deep_ep
+> paddle.enable_compat()   # MUST be called before importing torch / deep_ep
+> import torch
 > import deep_ep
 > # use deep_ep
 > ```
->
-> **Use with PaddleFleet**
->
-> DeepEP already integrates with PaddleFleet. You can install PaddleFleet pre-built wheel from our self-hosted index:
+
+> **Tests**
 >
 > ```bash
-> # For CUDA 12.9
-> pip install paddlefleet -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
-> # For CUDA 13.0
-> pip install paddlefleet -i https://www.paddlepaddle.org.cn/packages/stable/cu130/
+> # Single node, 8 GPUs
+> bash tests/run_ep8.sh tests/run_official_ep.py
+> bash tests/run_ep8.sh tests/run_official_ep.py --deterministic>
+> # Two nodes, 16 GPUs (run from the first node)
+> bash tests/run_ep16.sh <nodeA> <nodeB> tests/run_official_ep.py
 > ```
 >
-> All indexes are available at https://www.paddlepaddle.org.cn/install/quick
+> The upstream tests use `torch.multiprocessing.spawn`, which Paddle has no equivalent of, so they
+> run through two thin runners instead: `tests/run_official_ep.py` for `tests/ep/test_ep.py`, and
+> `tests/run_mod.py <test_file>` for every other module. Both install a fleet-based `init_dist` and
+> take the device index from `FLAGS_selected_gpus`.
 >
-> Then, you can use DeepEP in PaddleFleet as follows:
+> `run_ep8.sh` clears any `PADDLE_*` topology exported by a cluster scheduler, which would
+> otherwise make `paddle.distributed.launch` try to reach the other nodes. `--gpus` must start at 0
+> and be contiguous, since `local_rank` is used directly as the device index.
 >
-> ```python
-> from paddlefleet.ops import deep_ep
-> # use deep_ep
-> ```
+> `run_ep16.sh` drives both nodes from a single `mpirun`, exchanging the `PADDLE_*` endpoints
+> through the rendezvous directory `EP_RV_DIR`, which has to be visible from both nodes.
+>
+> If NCCL is kept outside the location Python would find by default, point both scripts at it with
+> `EP_NCCL_PKG_ROOT=<dir containing nvidia/nccl>`. That directory must come first on `PYTHONPATH`,
+> since torch resolves its NCCL package through `sys.path`, and mixing two NCCL runtimes in one
+> process crashes once Paddle creates a communicator.
 
 The original README.md content is as follows:
-
 ---
 
-DeepEP is a communication library tailored for Mixture-of-Experts (MoE) and expert parallelism (EP). It provides high-throughput and low-latency all-to-all GPU kernels, which are also known as MoE dispatch and combine. The library also supports low-precision operations, including FP8.
+DeepEP (DeepEveryParallel) is a high-performance communication library for machine learning training and inference. It provides high-throughput and low-latency expert-parallel (EP) all-to-all GPU kernels for MoE dispatch and combine, including FP8 dispatch, and NVLink weight and gradient exchange for redundant experts. It also offers experimental primitives for pipeline parallelism (PP), context parallelism (CP), data parallelism (DP), and remote memory access (Engram). Communication kernels are compiled at runtime via [DeepJIT](https://github.com/deepseek-ai/DeepJIT), with the supporting extension built during installation.
 
-To align with the group-limited gating algorithm proposed in the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) paper, DeepEP offers a set of kernels optimized for asymmetric-domain bandwidth forwarding, such as forwarding data from NVLink domain to RDMA domain. These kernels deliver high throughput, making them suitable for both training and inference prefilling tasks. Additionally, they support SM (Streaming Multiprocessors) number control.
+## News
 
-For latency-sensitive inference decoding, DeepEP includes a set of low-latency kernels with pure RDMA to minimize delays. The library also introduces a hook-based communication-computation overlapping method that does not occupy any SM resource.
+- **Ascend version release**
+  - Same API and full performance on HUAWEI Ascend 950 NPUs
+  - Check [DeepEP-Ascend](https://github.com/deepseek-ai/DeepEP-Ascend) for more details
 
-Notice: the implementation in this library may have some slight differences from the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) paper.
+- **V2.5 release**:
+  - Split `ElasticBuffer` into `EPBuffer`, `EngramBuffer`, `PPBuffer`, and `BucketBuffer`, sharing the `BufferBase` lifecycle
+  - Add `BufferAllocator` for planning symmetric tensor allocations before buffer construction
+  - Add batched all-gather, reduce-scatter, and all-reduce through `BucketBuffer`, with sessions for ordinary PyTorch tensors
+  - Add `EPBuffer.lb_prefetch_weights` and `EPBuffer.lb_reduce_grads` for dynamic redundant experts: prefetch expert weights and quantization scales over NVLink before expert computation, then accumulate redundant experts' FP32 gradients into the original experts during backward. These primitives support the expert-replication approach explored by [MoonEP](https://github.com/MoonshotAI/MoonEP) and [UltraEP](https://github.com/Dots-Infra/UltraEP); see [Expert load balancing](#expert-load-balancing) for the API and integration requirements
+  - Support deferred EP epilogues, cached expanded layouts, and zero padding between experts
+  - Support multi-layer Engram storage on GPU or CPU, with one wait hook per layer
+  - Fully remove V1, including its APIs, NVSHMEM backend, and legacy documentation. NVSHMEM is no longer a dependency
 
-## Performance
+- **V2 release**: A complete refactoring of expert parallelism, with support for larger scale-up and scale-out domains and the lightweight **NCCL Gin backend**.
 
-### Normal kernels with NVLink and RDMA forwarding
+### New features
 
-We test normal kernels on H800 (~160 GB/s NVLink maximum bandwidth), with each connected to a CX7 InfiniBand 400 Gb/s RDMA network card (~50 GB/s maximum bandwidth). And we follow the DeepSeek-V3/R1 pretraining setting (4096 tokens per batch, 7168 hidden, top-4 groups, top-8 experts, FP8 dispatching and BF16 combining).
+- **JIT-compiled communication kernels** via DeepJIT
+- **NCCL Gin backend**
+  - Lightweight device-side communication APIs
+  - Able to reuse existing NCCL communicators
+- **EPv2**
+  - High-throughput and low-latency APIs unified into a single `EPBuffer` interface, with an expanded layout for grouped expert GEMMs
+  - Larger scale-up & scale-out domain support
+  - Analytical SM & QP count calculation — no more auto-tuning needed
+  - Both hybrid & direct modes remain supported
+- **Engram** (experimental, with RDMA)
+- **PP** (experimental, with RDMA)
+- **Bucket collectives** (experimental) for CP and DP (all-gather, reduce-scatter, and all-reduce)
 
-|   Type    | Dispatch #EP | Bottleneck bandwidth | Combine #EP | Bottleneck bandwidth |
-| :-------: | :----------: | :------------------: | :---------: | :------------------: |
-| Intranode |      8       |  153 GB/s (NVLink)   |      8      |  158 GB/s (NVLink)   |
-| Internode |      16      |    43 GB/s (RDMA)    |     16      |    43 GB/s (RDMA)    |
-| Internode |      32      |    58 GB/s (RDMA)    |     32      |    57 GB/s (RDMA)    |
-| Internode |      64      |    51 GB/s (RDMA)    |     64      |    50 GB/s (RDMA)    |
+### Notes
 
-**News (2025.04.22)**: with optimizations from Tencent Network Platform Department, performance was enhanced by up to 30%, see [#130](https://github.com/deepseek-ai/DeepEP/pull/130) for more details. Thanks for the contribution!
-
-### Low-latency kernels with pure RDMA
-
-We test low-latency kernels on H800 with each connected to a CX7 InfiniBand 400 Gb/s RDMA network card (~50 GB/s maximum bandwidth). And we follow a typical DeepSeek-V3/R1 production setting (128 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatching and BF16 combining).
-
-| Dispatch #EP | Latency | RDMA bandwidth | Combine #EP | Latency | RDMA bandwidth |
-| :----------: | :-----: | :------------: | :---------: | :-----: | :------------: |
-|      8       |  77 us  |    98 GB/s     |      8      | 114 us  |    127 GB/s    |
-|      16      | 118 us  |    63 GB/s     |     16      | 195 us  |    74 GB/s     |
-|      32      | 155 us  |    48 GB/s     |     32      | 273 us  |    53 GB/s     |
-|      64      | 173 us  |    43 GB/s     |     64      | 314 us  |    46 GB/s     |
-|     128      | 192 us  |    39 GB/s     |     128     | 369 us  |    39 GB/s     |
-|     256      | 194 us  |    39 GB/s     |     256     | 360 us  |    40 GB/s     |
-
-**News (2025.06.05)**: low-latency kernels now leverage NVLink as much as possible, see [#173](https://github.com/deepseek-ai/DeepEP/pull/173) for more details. Thanks for the contribution!
+- EP dispatch and combine require GPU SMs; zero-SM RDMA EP is not supported
+- Bucket, Engram, and PP are experimental features
+- Engram requires a NCCL build providing `ncclGinOptFlagsWarpGet`
 
 ## Quick start
 
 ### Requirements
 
-- Ampere (SM80), Hopper (SM90) GPUs, or other architectures with SM90 PTX ISA support
-- Python 3.8 and above
-- CUDA version
-  - CUDA 11.0 and above for SM80 GPUs
-  - CUDA 12.3 and above for SM90 GPUs
-- PyTorch 2.1 and above
+- Linux
+- Python 3.10 and above
+- NVIDIA Hopper or newer GPUs
+- CUDA Toolkit 13.1 and above for DeepJIT compilation, with support for the target GPU
+- A C++20 compiler and standard library with `std::format` support
+- PyTorch 2.10 and above, with CUDA support
+- NCCL 2.32.3 and above
 - NVLink for intranode communication
 - RDMA network for internode communication
 
-### Download and install NVSHMEM dependency
+Installation builds the host C++ extension against the CUDA and NCCL libraries. GPU kernels are compiled by DeepJIT for the current device at runtime, so installation does not require a visible GPU or `TORCH_CUDA_ARCH_LIST`. Keep the CUDA toolkit and host compiler available at runtime. Automatic bandwidth detection uses `nvidia-smi` and `ibstat`; `BucketBuffer` currently requires both NVLink and RDMA bandwidth to be detectable, even for a group using only one transport.
 
-DeepEP also depends on NVSHMEM. Please refer to our [NVSHMEM Installation Guide](third-party/README.md) for instructions.
+### Install NCCL dependency
 
-### Development
+Install the NCCL package matching your CUDA environment so DeepEP can locate its headers and library:
 
 ```bash
-# Build and make symbolic links for SO files
-NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py build
-# You may modify the specific SO names according to your own platform
-ln -s build/lib.linux-x86_64-cpython-38/deep_ep_cpp.cpython-38-x86_64-linux-gnu.so
-
-# Run test cases
-# NOTES: you may modify the `init_dist` function in `tests/utils.py`
-# according to your own cluster settings, and launch into multiple nodes
-python tests/test_intranode.py
-python tests/test_internode.py
-python tests/test_low_latency.py
+# CUDA 13.x
+python -m pip install "nvidia-nccl-cu13>=2.32.3" --no-deps
+# For CUDA 12.x, use nvidia-nccl-cu12 instead
 ```
+
+For a custom NCCL installation, set `EP_NCCL_ROOT_DIR` to a directory containing `include/` and `lib/`. PyTorch and DeepEP must load the same NCCL shared library. Builds using NCCL headers older than 2.31 additionally require an exact compile-time/runtime NCCL version match.
 
 ### Installation
 
 ```bash
-NVSHMEM_DIR=/path/to/installed/nvshmem python setup.py install
+# Initialize the DeepJIT submodule
+git submodule update --init --recursive
+
+# Build a wheel and install it into the current Python environment
+bash install.sh
 ```
 
-#### Installation environment variables
+Then import `deep_ep` in your Python project.
 
-- `NVSHMEM_DIR`: the path to the NVSHMEM directory, disable all internode and low-latency features if not specified
-- `DISABLE_SM90_FEATURES`: 0 or 1, whether to disable SM90 features, it is required for SM90 devices or CUDA 11
-- `TORCH_CUDA_ARCH_LIST`: the list of target architectures, e.g. `TORCH_CUDA_ARCH_LIST="9.0"`
-- `DISABLE_AGGRESSIVE_PTX_INSTRS`: 0 or 1, whether to disable aggressive load/store instructions, see [Undefined-behavior PTX usage](#undefined-behavior-ptx-usage) for more details
+### Development and tests
 
-Then, import `deep_ep` in your Python project, and enjoy!
+```bash
+# Build and link the extension into the source tree
+bash develop.sh
+
+# Run test cases
+python tests/ep/test_ep.py
+python tests/bucket/test_all_gather.py
+python tests/bucket/test_reduce_scatter.py
+python tests/bucket/test_all_reduce.py
+python tests/buffer/test_allocation.py
+python tests/ep/test_prefetch_weights.py
+python tests/ep/test_reduce_grads.py
+python tests/engram/test_engram.py
+python tests/pp/test_pp.py
+```
+
+The test scripts require NumPy and spawn local GPU workers. For multi-node tests, launch the same script on each node with a shared `MASTER_ADDR` and `MASTER_PORT`, setting `WORLD_SIZE` to the number of nodes and `RANK` to the node index. These are the conventions of `init_dist` in [deep_ep/utils/envs.py](deep_ep/utils/envs.py); adapt it to your cluster if needed. The tests default to `NCCL_IB_SL=1` and `EP_OVERRIDE_RDMA_SL=1` unless already set. Weight-prefetch and gradient-reduction tests use a single NVLink domain; PP tests require an RDMA-only group.
+
+## Interfaces and examples
+
+### Buffer initialization
+
+High-throughput and low-latency EP operations share a single `EPBuffer` interface. Initialize the buffer with MoE settings directly; SM and QP counts are estimated analytically and can be overridden per call.
+
+Create and reuse a buffer for each EP group. All ranks must agree on `num_max_tokens_per_rank`; choose a common capacity covering the intended training, prefill, and decoding batches. The example below manages one EP group. Finish outstanding operations before replacing its buffer.
+
+```python
+import torch.distributed as dist
+from typing import Optional
+
+from deep_ep import EPBuffer
+
+# Communication buffer (will allocate at runtime)
+_buffer: Optional[EPBuffer] = None
+
+# Number of SMs to use for communication kernels (will be set at buffer creation)
+_num_comm_sms: int = 0
+
+
+def get_buffer(group: dist.ProcessGroup,
+               num_max_tokens_per_rank: int,
+               hidden: int,
+               num_topk: int,
+               num_experts: int,
+               use_fp8_dispatch: bool = False) -> EPBuffer:
+    """Initialize or retrieve the EPBuffer for EP communication."""
+    global _buffer, _num_comm_sms
+
+    # Check if we can reuse the existing buffer
+    required_bytes = EPBuffer.get_buffer_size_hint(
+        group, num_max_tokens_per_rank, hidden,
+        num_topk=num_topk, use_fp8_dispatch=use_fp8_dispatch,
+    )
+    if _buffer is not None and _buffer.group == group and _buffer.num_bytes >= required_bytes:
+        _num_comm_sms = _buffer.get_theoretical_num_sms(num_experts, num_topk)
+        return _buffer
+
+    # Allocate a new buffer with MoE settings
+    _buffer = EPBuffer(
+        group,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        hidden=hidden,
+        num_topk=num_topk,
+        use_fp8_dispatch=use_fp8_dispatch,
+    )
+
+    # Estimate the SM count from the topology and communication volume
+    # You may also specify `num_sms` manually in dispatch/combine calls to override
+    _num_comm_sms = _buffer.get_theoretical_num_sms(num_experts, num_topk)
+
+    return _buffer
+```
+
+### Example use in model training and inference
+
+Training, inference prefilling, and inference decoding use the same `EPBuffer` dispatch and combine APIs. The example uses an expanded layout for grouped expert GEMMs and defers the forward epilogues until the framework waits for their results. Set `expert_alignment` to the grouped GEMM's token alignment; for DeepGEMM, use `deep_gemm.get_mk_alignment_for_contiguous_layout()`.
+
+`do_cpu_sync=True` obtains exact output sizes and CPU-side expert counts, commonly used for training and prefill. Set it to `False` when using GPU-side receive counts, as in decoding: outputs are allocated to the configured capacity, and the expert GEMMs must use `handle.psum_num_recv_tokens_per_expert` to identify valid expert ranges. A new routing decision needs a fresh dispatch; decoding alone does not make an old routing handle reusable.
+
+```python
+import torch
+from typing import Optional, Tuple, Union
+
+from deep_ep import EPBuffer, EPHandle, EventHandle, EventOverlap
+
+
+def dispatch_forward(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                     topk_idx: torch.Tensor, topk_weights: torch.Tensor,
+                     num_experts: int,
+                     num_max_tokens_per_rank: int,
+                     expert_alignment: int = 1,
+                     do_cpu_sync: bool = True,
+                     previous_event: Optional[EventHandle] = None) -> EventOverlap:
+    """
+    MoE dispatch: route tokens to the corresponding experts across all ranks.
+    Supports both BF16 and FP8 (x as a tuple of [data, scale_factors]) inputs.
+    Wait on the returned event to obtain the expanded tensors and routing handle.
+    """
+    global _buffer, _num_comm_sms
+
+    return _buffer.dispatch(
+        x,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        expert_alignment=expert_alignment,
+        num_sms=_num_comm_sms,
+        previous_event=previous_event,
+        async_with_compute_stream=True,
+        allocate_on_comm_stream=previous_event is not None,
+        do_cpu_sync=do_cpu_sync,
+        do_expand=True,
+        do_zero_padding=True,
+        use_tma_aligned_col_major_sf=True,
+        defer_epilogue=True,
+    )
+
+
+def dispatch_backward(grad_recv_x: torch.Tensor,
+                      grad_recv_topk_weights: torch.Tensor,
+                      handle: EPHandle,
+                      bias: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, EventOverlap]:
+    """The backward pass of MoE dispatch is actually a combine."""
+    global _buffer, _num_comm_sms
+
+    combined_grad_x, combined_grad_topk_weights, event = _buffer.combine(
+        grad_recv_x,
+        handle=handle,
+        bias=bias,
+        topk_weights=grad_recv_topk_weights,
+        num_sms=_num_comm_sms,
+        async_with_compute_stream=True,
+    )
+
+    return combined_grad_x, combined_grad_topk_weights, event
+
+
+def combine_forward(x: torch.Tensor,
+                    handle: EPHandle,
+                    bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
+                    previous_event: Optional[EventHandle] = None) -> EventOverlap:
+    """MoE combine: reduce expert outputs back to their original ranks."""
+    global _buffer, _num_comm_sms
+
+    return _buffer.combine(
+        x,
+        handle=handle,
+        bias=bias,
+        num_sms=_num_comm_sms,
+        previous_event=previous_event,
+        async_with_compute_stream=True,
+        allocate_on_comm_stream=previous_event is not None,
+        defer_epilogue=True,
+    )
+
+
+def combine_backward(grad_combined_x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                     handle: EPHandle) -> \
+        Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], EventOverlap]:
+    """The backward pass of MoE combine is actually a dispatch."""
+    global _buffer, _num_comm_sms
+
+    grad_x, _, _, _, event = _buffer.dispatch(
+        grad_combined_x,
+        handle=handle,
+        num_sms=_num_comm_sms,
+        async_with_compute_stream=True,
+        do_expand=True,
+        do_zero_padding=True,
+        use_tma_aligned_col_major_sf=True,
+    )
+
+    return grad_x, event
+```
+
+For communication-computation overlap, launch communication first and wait at the point where the expert computation needs its results:
+
+```python
+# Use do_cpu_sync=False for decoding with GPU-side expert counts
+event = dispatch_forward(...)
+
+# ... do some independent computation here ...
+
+# Run the deferred dispatch epilogue and obtain its results
+recv_x, _, recv_topk_weights, handle = event.current_stream_wait()
+
+# ... run the expert GEMMs and apply recv_topk_weights to produce expert_output ...
+event = combine_forward(expert_output, handle)
+
+# ... do some independent computation here ...
+combined_x, _ = event.current_stream_wait()
+```
+
+The expanded `recv_topk_weights` is one-dimensional, with one value per expert row. The expert computation applies these router weights before combine; combine sums the supplied expert outputs. Combine inputs must be BF16. `bias` can add the shared-expert output or residual during the combine epilogue.
+
+Training saves the forward `handle` for `combine_backward` and `dispatch_backward`. The backward helpers above return tensors and an event; wait on that event before using the tensors. Cached dispatch replays the saved expanded layout without another receive-count CPU synchronization. Keep the original `topk_idx` unchanged until all uses of the handle finish.
+
+### Deferred epilogues
+
+Dispatch and combine accept `defer_epilogue=True` together with `async_with_compute_stream=True`. In this mode, the call returns an `EventOverlap` directly. Calling `.wait()` runs the deferred epilogue on the current stream and returns `(recv_x, recv_topk_idx, recv_topk_weights, handle)` for dispatch, or `(combined_x, combined_topk_weights)` for combine.
+
+The returned result is produced by the first wait, so retain it for the following computation. Without other work to overlap, call `.wait()` immediately. `do_zero_padding=True` clears alignment gaps between experts; in the no-CPU-sync mode, it does not make unused output capacity valid data.
+
+If independent computation is already queued before the communication call, capture the input-ready event with `_buffer.capture()` before enqueueing that computation and pass it as `previous_event`. The forward helpers set `allocate_on_comm_stream=True` in this case, as required by EP. The deferred epilogue still runs on the current stream at `.wait()`; this also allows a combine `bias` produced by the intervening computation to be consumed there.
+
+### Bucket collectives (experimental)
+
+`BucketBuffer` provides batched `all_gather`, `reduce_scatter`, and `all_reduce` for CP and DP workloads. In normal usage, inputs must reside in the bucket's own storage. Use `BufferAllocator` to plan tensors before creating the buffer. The plan's meta tensors become CUDA views into the buffer when it is constructed.
+
+```python
+import torch
+
+from deep_ep import BufferAllocator, BucketBuffer
+
+# group is an initialized CP or DP process group
+allocation_plan = BufferAllocator()
+x = allocation_plan.allocate((group.size(), 1024), torch.float32)
+buffer = BucketBuffer(group, allocation_plan)
+
+# Gather each rank's local shard into the registered tensor
+x[group.rank()].fill_(group.rank())
+gathered_x = buffer.all_gather(x[group.rank()]).wait()
+
+# Reduce-scatter and all-reduce use FP32 tensors in the buffer
+x.fill_(1)
+shard = buffer.reduce_scatter(x).wait()
+x.fill_(1)
+reduced_x = buffer.all_reduce(x).wait()
+```
+
+All ranks must use the same allocation plan. Each collective also accepts a list of tensors, and `.wait()` returns the corresponding tensor or list of tensors. Results are views into the buffer; all-gather returns flattened views. Reduce-scatter and all-reduce accept FP32 inputs and sum contributions by default; use `scale` to scale the result. Reduce-scatter also supports `comm_precision="bf16"` for lower-precision communication while retaining FP32 input and output tensors.
+
+To use tensors allocated outside the bucket, wrap the collective calls in a `buffer.session()`. The session manages temporary bucket storage and the required staging copies:
+
+```python
+with buffer.session():
+    reduced_x = buffer.all_reduce(external_x).wait()
+    # Consume or copy reduced_x before reusing the session storage
+```
+
+The NVLink-only all-gather path also supports an external source with an explicitly supplied in-bucket `dsts`; use a session for general out-of-bucket inputs.
+
+All three collectives support NVLink, RDMA, and hybrid domains. NVLink reductions require NCCL multimem support. All-gather is driven by copy engines (`num_sms=0`); reduce-scatter and all-reduce use GPU SMs. See [the bucket tests](tests/bucket) and [allocation tests](tests/buffer/test_allocation.py) for examples, including registration with multiple communication groups.
+
+### Expert load balancing
+
+Dynamic expert replication spreads a heavily loaded expert's computation across additional GPUs. [MoonEP](https://github.com/MoonshotAI/MoonEP) explores online planning with dynamic redundant experts, weight prefetching, and gradient reduction. [UltraEP](https://github.com/Dots-Infra/UltraEP) ([paper](https://arxiv.org/abs/2606.04101)) plans replication and token rerouting from the current post-gating load, keeping expert replication within the NVLink domain. These works motivate the redundant-expert communication primitives exposed by `EPBuffer`.
+
+- `lb_prefetch_weights(redundant_expert_weights, expert_weights, redundancy_mapping)` pushes original expert weights to the requested redundant slots before expert computation. It accepts one tensor or matching nonempty tensor sequences, so weights and quantization scales can be transferred together without dtype conversion.
+- `lb_reduce_grads(redundant_expert_grads, expert_grads, redundancy_mapping)` reads the redundant experts' FP32 gradients over NVLink and adds them into the original experts' gradients in place. Use the same mapping as the forward pass and initialize `expert_grads` with the local contribution, or zeros, before reduction.
+
+The caller supplies the replication plan, reroutes tokens to the chosen expert instances, and manages the expert GEMMs. Both exchange operations are collective within each NVLink domain: every rank in that domain must call them, including ranks with no assigned redundant slots. They run asynchronously on the communication stream and return an `EventOverlap`; call `.wait()` before consuming their results. `previous_event` can specify when the inputs are ready, and `num_sms=0` selects an analytical SM estimate.
+
+Reserve redundant weight and gradient storage with `lb_allocation_plan_or_num_bytes`, using a `BufferAllocator` plan or an aligned byte count. This LB region is separate from the EP dispatch/combine buffer. The redundant tensors must reside in it; original expert weights and gradients can use ordinary CUDA allocations. Plans must have the same shapes and allocation order on every rank in the NVLink domain.
+
+`redundancy_mapping` must be a contiguous CUDA int32 tensor of shape `[num_nvlink_ranks, num_redundant_experts]`, with identical contents on every rank in the domain. Entry `[r, c]` assigns an expert to redundant slot `c` on domain-local rank `r`, or is `-1` for an unused slot. Expert IDs are `owner_rank * num_local_experts + local_expert_idx`, using domain-local rank indices. Assign replicas to peers; a rank's own experts must not appear in its redundant slots. Unused slots are skipped.
+
+All weight and gradient tensors must be contiguous CUDA tensors. Weight tensors have leading dimension `num_local_experts` and redundant tensors `num_redundant_experts`; the trailing shapes may differ as long as each matching pair has the same byte count per expert, a multiple of `deep_ep.get_num_tma_alignment()` (32 bytes). All ranks in the domain must have the same `num_local_experts`. Gradient reduction takes two-dimensional FP32 tensors; flatten each expert's parameters into a row with the same byte alignment.
+
+```python
+import torch
+
+from deep_ep import BufferAllocator, EPBuffer
+
+# Use the same plan on every rank; each example expert row is 1024 elements
+lb_plan = BufferAllocator()
+redundant_weights = lb_plan.allocate((num_redundant_experts, 1024), torch.bfloat16)
+redundant_grads = lb_plan.allocate((num_redundant_experts, 1024), torch.float32)
+buffer = EPBuffer(
+    group,
+    num_max_tokens_per_rank=num_max_tokens_per_rank,
+    hidden=hidden,
+    num_topk=num_topk,
+    lb_allocation_plan_or_num_bytes=lb_plan,
+)
+
+# expert_weights: contiguous CUDA BF16 [num_local_experts, 1024]
+# redundancy_mapping: supplied by the caller's replication planner
+weights_ready = buffer.lb_prefetch_weights(
+    redundant_weights, expert_weights, redundancy_mapping,
+)
+# ... independent computation can overlap the exchange ...
+weights_ready.wait()
+# ... run expert computation using the prefetched weights ...
+
+# After backward has written redundant_grads and the local expert_grads:
+grads_ready = buffer.lb_reduce_grads(
+    redundant_grads, expert_grads, redundancy_mapping,
+)
+# ... independent backward computation can overlap the reduction ...
+grads_ready.wait()
+# expert_grads now includes contributions from all redundant instances
+```
+
+Keep the mapping and tensor storage valid until the corresponding exchange finishes. If redundant storage is reused across layers or microbatches, restore the required weights before backward computation and finish gradient reduction before reusing its inputs. Reduction does not clear redundant gradients; overwrite or zero them before the next accumulation. See [weight prefetch tests](tests/ep/test_prefetch_weights.py) and [gradient reduction tests](tests/ep/test_reduce_grads.py) for complete allocation and correctness examples.
+
+### Engram (experimental)
+
+`EngramBuffer` supports GPU/CPU storage and multi-layer fetches over RDMA. Use `get_storage_size_hint` and `get_theoretical_config` to size the buffer and its QPs, then `set_config` and `write` to populate the layer tables.
+
+`fetch(indices)` takes an int32 tensor of shape `[num_layers, num_tokens, num_entries_per_token]` and returns one completion hook per layer. Call the corresponding hook before using that layer's fetched data. See [Engram tests](tests/engram/test_engram.py) for BF16, FP8, and CPU storage examples.
+
+### Pipeline parallelism (experimental)
+
+`PPBuffer` provides `send(x, dst_rank_idx)` and `recv(x, src_rank_idx)` between adjacent ranks in an RDMA-only pipeline group. Set `num_max_tensor_bytes` and `num_max_inflight_tensors` at construction to reserve the send/recv slots. Inputs and outputs must be contiguous CUDA tensors with 32-byte-aligned pointers and sizes. See [PP tests](tests/pp/test_pp.py) for usage.
+
+### Environment variables
+
+Set runtime variables before importing `deep_ep` and creating buffers. Flags use `0`/`1` unless noted. The defaults below assume no build-time defaults have been packaged.
+
+**Runtime and networking**
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `EP_BUFFER_DEBUG` | Unset | Set to `1` to print initialization, topology, buffer-size, and SM-estimation diagnostics. Leave unset to disable all diagnostics; Python-side checks also treat the string `"0"` as enabled. |
+| `EP_SUPPRESS_NCCL_CHECK` | `0` | Skip the import-time checks for duplicate NCCL libraries and binary equality with the selected installation. Does not bypass the C++ device-communicator compatibility checks. |
+| `EP_AVOID_RECORD_STREAM` | `0` | For EP and bucket operations, retain tensors in the completion event instead of calling `record_stream`. Keep the event alive until communication has completed. |
+| `EP_REUSE_NCCL_COMM` | `1` | Reuse the PyTorch process group's NCCL communicator when its backend exposes `_comm_ptr`; otherwise create a DeepEP-managed communicator. |
+| `EP_DEFAULT_RDMA_SL` | Unset | Set the Gin traffic class/service level when the buffer's `sl_idx` is not supplied. If both are unset, use NCCL's default. |
+| `EP_OVERRIDE_RDMA_SL` | Unset | Override both `EP_DEFAULT_RDMA_SL` and the buffer's `sl_idx`. |
+| `EP_DISABLE_GIN` | `0` | Skip Gin initialization for NVLink-only use. RDMA operations require Gin; this flag does not select another RDMA backend. |
+| `EP_NUM_MAX_LOCAL_RANKS` | `16` | Engram only: estimate registered storage for `NCCL_WIN_STRIDE` sizing in hybrid mode. This is a sizing estimate, not a rank-count limit. |
+
+**JIT compilation**
+
+DeepJIT reads `EP_JIT_*` first, then the corresponding `DJ_JIT_*` variable as a global fallback. Configure these before the first kernel compilation. An explicit `EP_JIT_*` value, including a packaged default, takes precedence over `DJ_JIT_*`.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `EP_JIT_DEBUG` | `0` | Enable compiler-command and kernel-load diagnostics, PTXAS output, source line information, and PTX/SASS dumps. |
+| `EP_JIT_CACHE_DIR` | `$HOME/.dj` | Cache root or colon-separated list of roots. Search all roots in order and write newly compiled artifacts to the first. |
+| `EP_JIT_NVCC_COMPILER` | Detected toolkit's `bin/nvcc` | Override the NVCC executable; a valid CUDA toolkit root must still be discoverable. |
+| `EP_JIT_CPP_STANDARD` | `20` | C++ standard passed to NVCC. DeepEP requires C++20 or newer. |
+| `EP_JIT_PRINT_COMPILER_COMMAND` | `0` | Print compiler and disassembler commands. |
+| `EP_JIT_PRINT_LOAD_TIME` | `0` | Print kernel-binary loading time. |
+| `EP_JIT_PTXAS_VERBOSE` | `0` | Enable and print detailed PTXAS output. |
+| `EP_JIT_CHECK_NO_SPILLS` | `0` | Reject compiled kernels with register spills. |
+| `EP_JIT_CHECK_NO_LOCAL_MEMORY` | `0` | Reject compiled kernels with local-memory usage. |
+| `EP_JIT_WITH_LINEINFO` | `0` | Embed source line information for profiling. |
+| `EP_JIT_DUMP_ASM` | `0` | Generate both PTX and SASS artifacts on a cache miss. |
+| `EP_JIT_DUMP_PTX` | `0` | Generate PTX artifacts on a cache miss. |
+| `EP_JIT_DUMP_SASS` | `0` | Generate SASS artifacts on a cache miss; requires the toolkit's `cuobjdump`. |
+| `EP_GIN_GDAKI_DEBUG` | `0` | Compile JIT kernels with NCCL Gin GDAKI device debugging enabled. |
+
+DeepJIT discovers the CUDA toolkit through `CUDA_HOME`, then `CUDA_PATH`, then `nvcc` on `PATH`, and finally `/usr/local/cuda`.
+
+**Build and dependency discovery**
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `EP_NCCL_ROOT_DIR` | Auto-detected | NCCL installation with `include/` and `lib/`, used at build and import time. Takes precedence over `NCCL_DIR`, then NVIDIA Python package discovery. |
+| `EP_NUM_TOPK_IDX_BITS` | `64` | Build-time top-k index width (`32` or `64`). Use the exported `deep_ep.topk_idx_t` for routing indices. Changing this value requires rebuilding the extension. |
+
+When set during a package build, these variables are stored as import-time defaults: `EP_JIT_CACHE_DIR`, `EP_JIT_PRINT_COMPILER_COMMAND`, `EP_JIT_CPP_STANDARD`, `EP_NUM_TOPK_IDX_BITS`, `EP_NCCL_ROOT_DIR`, `EP_DEFAULT_RDMA_SL`, and `EP_OVERRIDE_RDMA_SL`. Existing environment values take precedence at import. Overriding `EP_NUM_TOPK_IDX_BITS` at runtime does not change the compiled index type.
+
+**Test profiling**
+
+These flags affect `bench_kineto` in [deep_ep/utils/testing.py](deep_ep/utils/testing.py), not production communication:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `EP_USE_NVIDIA_TOOLS` | `0` | Skip the internal profiler when using Nsight or Compute Sanitizer. Reported internal timings are placeholders while this is enabled. |
+| `EP_DISABLE_BARRIER_PROFILING` | `0` | Disable the barrier and delay inserted before each profiled iteration. |
 
 ## Network configurations
 
@@ -142,251 +519,70 @@ Traffic isolation is supported by InfiniBand through Virtual Lanes (VL).
 
 To prevent interference between different types of traffic, we recommend segregating workloads across different virtual lanes as follows:
 
-- workloads using normal kernels
-- workloads using low-latency kernels
+- expert-parallel workloads
 - other workloads
 
-For DeepEP, you can control the virtual lane assignment by setting the `NVSHMEM_IB_SL` environment variable.
+Select the RDMA service level through the buffer's `sl_idx` argument. The precedence is `EP_OVERRIDE_RDMA_SL` > `sl_idx` > `EP_DEFAULT_RDMA_SL` > NCCL's default. The fabric's SL-to-VL mapping determines which virtual lane carries that traffic.
 
 ### Adaptive routing
 
-Adaptive routing is an advanced routing feature provided by InfiniBand switches that can evenly distribute traffic across multiple paths. Enabling adaptive routing can completely eliminate network congestion caused by routing conflicts, but it also introduces additional latency. We recommend the following configuration for optimal performance:
-
-- enable adaptive routing in environments with heavy network loads
-- use static routing in environments with light network loads
+Adaptive routing is an advanced routing feature provided by InfiniBand switches that can evenly distribute traffic across multiple paths. Even though adaptive routing introduces additional latency, we still recommend enabling it under all network load conditions.
 
 ### Congestion control
 
-Congestion control is disabled as we have not observed significant congestion in our production environment.
+For maximum-bandwidth workloads, we recommend disabling congestion control after validating the fabric configuration. If congestion is unavoidable, place those workloads on lower-priority virtual lanes. DeepEP does not configure congestion control on the fabric.
 
-## Interfaces and examples
+### PCI atomic mode
 
-### Example use in model training or inference prefilling
+If the hardware supports it, we recommend using the following command to set the NIC's `PCI_ATOMIC_MODE` to improve RDMA atomic operation performance:
 
-The normal kernels can be used in model training or the inference prefilling phase (without the backward part) as the below example code shows.
-
-```python
-import torch
-import torch.distributed as dist
-from typing import List, Tuple, Optional, Union
-
-from deep_ep import Buffer, EventOverlap
-
-# Communication buffer (will allocate at runtime)
-_buffer: Optional[Buffer] = None
-
-# Set the number of SMs to use
-# NOTES: this is a static variable
-Buffer.set_num_sms(24)
-
-
-# You may call this function at the framework initialization
-def get_buffer(group: dist.ProcessGroup, hidden_bytes: int) -> Buffer:
-    global _buffer
-
-    # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
-    num_nvl_bytes, num_rdma_bytes = 0, 0
-    for config in (Buffer.get_dispatch_config(group.size()), Buffer.get_combine_config(group.size())):
-        num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
-        num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
-
-    # Allocate a buffer if not existed or not enough buffer size
-    if _buffer is None or _buffer.group != group or _buffer.num_nvl_bytes < num_nvl_bytes or _buffer.num_rdma_bytes < num_rdma_bytes:
-        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
-    return _buffer
-
-
-def get_hidden_bytes(x: torch.Tensor) -> int:
-    t = x[0] if isinstance(x, tuple) else x
-    return t.size(1) * max(t.element_size(), 2)
-
-
-def dispatch_forward(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-                     topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                     num_experts: int, previous_event: Optional[EventOverlap] = None) -> \
-        Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], torch.Tensor, torch.Tensor, List, Tuple, EventOverlap]:
-    # NOTES: an optional `previous_event` means a CUDA event captured that you want to make it as a dependency
-    # of the dispatch kernel, it may be useful with communication-computation overlap. For more information, please
-    # refer to the docs of `Buffer.dispatch`
-    global _buffer
-
-    # Calculate layout before actual dispatch
-    num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, previous_event = \
-        _buffer.get_dispatch_layout(topk_idx, num_experts,
-                                    previous_event=previous_event, async_finish=True,
-                                    allocate_on_comm_stream=previous_event is not None)
-    # Do MoE dispatch
-    # NOTES: the CPU will wait for GPU's signal to arrive, so this is not compatible with CUDA graph
-    # Unless you specify `num_worst_tokens`, but this flag is for intranode only
-    # For more advanced usages, please refer to the docs of the `dispatch` function
-    recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
-        _buffer.dispatch(x, topk_idx=topk_idx, topk_weights=topk_weights,
-                         num_tokens_per_rank=num_tokens_per_rank, num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-                         is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
-                         previous_event=previous_event, async_finish=True,
-                         allocate_on_comm_stream=True)
-    # For event management, please refer to the docs of the `EventOverlap` class
-    return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event
-
-
-def dispatch_backward(grad_recv_x: torch.Tensor, grad_recv_topk_weights: torch.Tensor, handle: Tuple) -> \
-        Tuple[torch.Tensor, torch.Tensor, EventOverlap]:
-    global _buffer
-
-    # The backward process of MoE dispatch is actually a combine
-    # For more advanced usages, please refer to the docs of the `combine` function
-    combined_grad_x, combined_grad_recv_topk_weights, event = \
-        _buffer.combine(grad_recv_x, handle, topk_weights=grad_recv_topk_weights, async_finish=True)
-
-    # For event management, please refer to the docs of the `EventOverlap` class
-    return combined_grad_x, combined_grad_recv_topk_weights, event
-
-
-def combine_forward(x: torch.Tensor, handle: Tuple, previous_event: Optional[EventOverlap] = None) -> \
-        Tuple[torch.Tensor, EventOverlap]:
-    global _buffer
-
-    # Do MoE combine
-    # For more advanced usages, please refer to the docs of the `combine` function
-    combined_x, _, event = _buffer.combine(x, handle, async_finish=True, previous_event=previous_event,
-                                           allocate_on_comm_stream=previous_event is not None)
-
-    # For event management, please refer to the docs of the `EventOverlap` class
-    return combined_x, event
-
-
-def combine_backward(grad_combined_x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-                     handle: Tuple, previous_event: Optional[EventOverlap] = None) -> \
-        Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], EventOverlap]:
-    global _buffer
-
-    # The backward process of MoE combine is actually a dispatch
-    # For more advanced usages, please refer to the docs of the `dispatch` function
-    grad_x, _, _, _, _, event = _buffer.dispatch(grad_combined_x, handle=handle, async_finish=True,
-                                                 previous_event=previous_event,
-                                                 allocate_on_comm_stream=previous_event is not None)
-
-    # For event management, please refer to the docs of the `EventOverlap` class
-    return grad_x, event
+```bash
+# Replace mlx5_0 with the target NIC
+sudo mlxconfig -y -d mlx5_0 set PCI_ATOMIC_MODE=4
 ```
 
-Moreover, inside the dispatch function, we may not know how many tokens to receive for the current rank. So an implicit CPU wait for GPU received count signal will be involved, as the following figure shows.
+## Experimental branches
 
-![normal](figures/normal.png)
+The following links describe separate implementations and research branches. Their features and dependencies apply to those branches; consult each branch before integrating it with the current API.
 
-### Example use in inference decoding
+- [Zero-copy](https://github.com/deepseek-ai/DeepEP/pull/453)
+    - Removing the copy between PyTorch tensors and communication buffers, which reduces the SM usages significantly for normal kernels
+    - This PR is authored by **Tencent Network Platform Department**
+- [Eager](https://github.com/deepseek-ai/DeepEP/pull/437)
+    - Using a low-latency protocol removes the extra RTT latency introduced by RDMA atomic OPs
+- [Hybrid-EP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep)
+    - A new backend implementation using TMA instructions for minimal SM usage and larger NVLink domain support
+    - Fine-grained communication-computation overlap for single-batch scenarios
+    - PCIe kernel support for non-NVLink environments
+    - NVFP4 data type support
+- [AntGroup-Opt](https://github.com/deepseek-ai/DeepEP/tree/antgroup-opt)
+    - This optimization series is authored by **AntGroup Network Platform Department**
+    - [Normal-SMFree](https://github.com/deepseek-ai/DeepEP/pull/347) Eliminating SM from RDMA path by decoupling comm-kernel execution from NIC token transfer, freeing SMs for compute
+    - [LL-SBO](https://github.com/deepseek-ai/DeepEP/pull/483) Overlapping Down GEMM computation with Combine Send communication via signaling mechanism to reduce end-to-end latency
+    - [LL-Layered](https://github.com/deepseek-ai/DeepEP/pull/500) Optimizing cross-node LL operator communication using rail-optimized forwarding and data merging to reduce latency
+- [Mori-EP](https://github.com/deepseek-ai/DeepEP/tree/mori-ep)
+    - ROCm/AMD GPU support powered by [MORI](https://github.com/ROCm/mori) backend (low-latency mode)
+- [nvDev](https://github.com/deepseek-ai/DeepEP/tree/nvDev)
+    - V2-based branch with the latest CUDA features, such as Compute Fabric Transport (CFT) that brings better latency on small token sizes.
 
-The low latency kernels can be used in the inference decoding phase as the below example code shows.
+## Community forks
 
-```python
-import torch
-import torch.distributed as dist
-from typing import Tuple, Optional
+- [uccl/uccl-ep](https://github.com/uccl-project/uccl/tree/main/ep) - Enables running DeepEP on heterogeneous GPUs (e.g., Nvidia, AMD) and NICs (e.g., EFA, Broadcom, CX7)
+- [Infrawaves/DeepEP_ibrc_dual-ports_multiQP](https://github.com/Infrawaves/DeepEP_ibrc_dual-ports_multiQP) - Adds multi-QP solution and dual-port NIC support in IBRC transport
+- [antgroup/DeepXTrace](https://github.com/antgroup/DeepXTrace) - A diagnostic analyzer for efficient and precise localization of slow ranks
+- [ROCm/mori](https://github.com/ROCm/mori) - AMD's next-generation communication library for performance-critical AI workloads (e.g., Wide EP, KVCache transfer, Collectives)
 
-from deep_ep import Buffer
+## Acknowledgement
 
-# Communication buffer (will allocate at runtime)
-# NOTES: there is no SM control API for the low-latency kernels
-_buffer: Optional[Buffer] = None
+DeepEP is built on top of the [NCCL](https://github.com/nvidia/nccl) Gin backend. Thanks to [@sjeaugey](https://github.com/sjeaugey), [@pakmarkthub](https://github.com/pakmarkthub), [@sb17v](https://github.com/sb17v), [@xiaofanl-nvidia](https://github.com/xiaofanl-nvidia), and the NCCL team for their support!
 
-
-# You may call this function at the framework initialization
-def get_buffer(group: dist.ProcessGroup, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> Buffer:
-    # NOTES: the low-latency mode will consume much more space than the normal mode
-    # So we recommend that `num_max_dispatch_tokens_per_rank` (the actual batch size in the decoding engine) should be less than 256
-    global _buffer
-    num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, group.size(), num_experts)
-
-    # Allocate a buffer if not existed or not enough buffer size
-    if _buffer is None or _buffer.group != group or not _buffer.low_latency_mode or _buffer.num_rdma_bytes < num_rdma_bytes:
-        # NOTES: for the best performance, the QP number **must** be equal to the number of the local experts
-        assert num_experts % group.size() == 0
-        _buffer = Buffer(group, 0, num_rdma_bytes, low_latency_mode=True, num_qps_per_rank=num_experts // group.size())
-    return _buffer
-
-
-def low_latency_dispatch(hidden_states: torch.Tensor, topk_idx: torch.Tensor, num_max_dispatch_tokens_per_rank: int, num_experts: int):
-    global _buffer
-
-    # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
-    recv_hidden_states, recv_expert_count, handle, event, hook = \
-        _buffer.low_latency_dispatch(hidden_states, topk_idx, num_max_dispatch_tokens_per_rank, num_experts,
-                                     async_finish=False, return_recv_hook=True)
-
-    # NOTES: the actual tensor will not be received only if you call `hook()`,
-    # it is useful for double-batch overlapping, but **without any SM occupation**
-    # If you don't want to overlap, please set `return_recv_hook=False`
-    # Later, you can use our GEMM library to do the computation with this specific format
-    return recv_hidden_states, recv_expert_count, handle, event, hook
-
-
-def low_latency_combine(hidden_states: torch.Tensor,
-                        topk_idx: torch.Tensor, topk_weights: torch.Tensor, handle: Tuple):
-    global _buffer
-
-    # Do MoE combine, compatible with CUDA graph (but you may restore some buffer status once you replay)
-    combined_hidden_states, event_overlap, hook = \
-        _buffer.low_latency_combine(hidden_states, topk_idx, topk_weights, handle,
-                                    async_finish=False, return_recv_hook=True)
-
-    # NOTES: the same behavior as described in the dispatch kernel
-    return combined_hidden_states, event_overlap, hook
-```
-
-For two-micro-batch overlapping, you can refer to the following figure. With our receiving hook interface, the RDMA network traffic is happening in the background, without costing any GPU SMs from the computation part. But notice, the overlapped parts can be adjusted, i.e., the 4 parts of attention/dispatch/MoE/combine may not have the exact same execution time. You may adjust the stage settings according to your workload.
-
-![low-latency](figures/low-latency.png)
-
-## Roadmap
-
-- [x] AR support
-- [x] Refactor low-latency mode AR code
-- [x] A100 support (intranode only)
-- [x] Support BF16 for the low-latency dispatch kernel
-- [x] Support NVLink protocol for intranode low-latency kernels
-- [ ] TMA copy instead of LD/ST
-  - [x] Intranode kernels
-  - [ ] Internode kernels
-  - [ ] Low-latency kernels
-- [ ] SM-free kernels and refactors
-- [ ] Fully remove undefined-behavior PTX instructions
-
-## Notices
-
-#### Easier potential overall design
-
-The current DeepEP implementation uses queues for communication buffers which save memory but introduce complexity and potential deadlocks. If you're implementing your own version based on DeepEP, consider using fixed-size buffers allocated to maximum capacity for simplicity and better performance. For a detailed discussion of this alternative approach, see https://github.com/deepseek-ai/DeepEP/issues/39.
-
-#### Undefined-behavior PTX usage
-
-- For extreme performance, we discover and use an undefined-behavior PTX usage: using read-only PTX `ld.global.nc.L1::no_allocate.L2::256B` to **read volatile data**. The PTX modifier `.nc` indicates that a non-coherent cache is used. But the correctness is tested to be guaranteed with `.L1::no_allocate` on Hopper architectures, and performance will be much better. The reason we guess may be: the non-coherent cache is unified with L1, and the L1 modifier is not just a hint but a strong option, so that the correctness can be guaranteed by no dirty data in L1.
-- Initially, because NVCC could not automatically unroll volatile read PTX, we tried using `__ldg` (i.e., `ld.nc`). Even compared to manually unrolled volatile reads, it was significantly faster (likely due to additional compiler optimizations). However, the results could be incorrect or dirty. After consulting the PTX documentation, we discovered that L1 and non-coherent cache are unified on Hopper architectures. We speculated that `.L1::no_allocate` might resolve the issue, leading to this discovery.
-- If you find kernels not working on some other platforms, you may add `DISABLE_AGGRESSIVE_PTX_INSTRS=1` to `setup.py` and disable this, or file an issue.
-
-#### Auto-tuning on your cluster
-
-For better performance on your cluster, we recommend to run all the tests and use the best auto-tuned configuration. The default configurations are optimized on the DeepSeek's internal cluster.
+We also acknowledge [MoonEP](https://github.com/MoonshotAI/MoonEP) and [UltraEP](https://github.com/Dots-Infra/UltraEP) for their work on dynamic expert replication and the weight/gradient exchange that supports expert load balancing.
 
 ## License
 
-This code repository is released under [the MIT License](LICENSE), except for codes that reference NVSHMEM (including `csrc/kernels/ibgda_device.cuh` and `third-party/nvshmem.patch`), which are subject to [NVSHMEM SLA](https://docs.nvidia.com/nvshmem/api/sla.html).
-
-## Experimental Branches
-
-- [Zero-copy](https://github.com/deepseek-ai/DeepEP/pull/453)
-  - Removing the copy between PyTorch tensors and communication buffers, which reduces the SM usages significantly for normal kernels
-  - This PR is authored by **Tencent Network Platform Department**
-- [Eager](https://github.com/deepseek-ai/DeepEP/pull/437)
-  - Using a low-latency protocol removes the extra RTT latency introduced by RDMA atomic OPs
-
-## Community Forks
-
-- [Infrawaves/DeepEP_ibrc_dual-ports_multiQP](https://github.com/Infrawaves/DeepEP_ibrc_dual-ports_multiQP) - Adds multi-QP solution and dual-port NIC support in IBRC transport
-- [antgroup/DeepXTrace](https://github.com/antgroup/DeepXTrace) - A diagnostic analyzer for efficient and precise localization of slow ranks
+This code repository is released under [the MIT License](LICENSE).
 
 ## Citation
-
-If you use this codebase or otherwise find our work valuable, please cite:
 
 ```bibtex
 @misc{deepep2025,

@@ -1,10 +1,39 @@
+# VS Code
 compile_commands.json
-.idea
-.DS_Store
-*.pyc
-build/
+.clangd
 .cache/
 .vscode/
+
+# macOS
+.DS_Store
+
+# JetBrains
+.idea
 */cmake-build-*/
-*.egg-info
-.humanize
+
+# Python
+*.pyc
+
+# Build
+build/
+*.so
+.ninja_deps
+.ninja_log
+# Un-registered local clone used by the JIT build
+third-party/fmt/
+deep_ep.egg-info/
+dist/
+# Paddle cpp_extension generated loader stub (pairs with deep_ep/_C_pd_.so)
+deep_ep/_C.py
+
+# Coredump
+coredump/
+
+# DeepJIT cache
+.dj/
+
+# OpenCode
+.sisyphus/
+AGENTS.md
+log/
+*.md

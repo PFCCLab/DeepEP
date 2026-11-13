@@ -3,19 +3,12 @@ function(add_deep_ep_library target_name source_file)
     set_target_properties(${target_name} PROPERTIES
             POSITION_INDEPENDENT_CODE ON
             CXX_STANDARD_REQUIRED ON
-            CUDA_STANDARD_REQUIRED ON
-            CXX_STANDARD 17
-            CUDA_STANDARD 17
-            CUDA_SEPARABLE_COMPILATION ON
+            CXX_STANDARD 20
     )
-    target_link_libraries(${target_name} PUBLIC nvshmem cudart cudadevrt mlx5)
+    target_link_libraries(${target_name} PUBLIC CUDA::cudart)
 endfunction()
 
-add_deep_ep_library(runtime_cuda runtime.cu)
-add_deep_ep_library(layout_cuda layout.cu)
-add_deep_ep_library(intranode_cuda intranode.cu)
-add_deep_ep_library(internode_cuda internode.cu)
-add_deep_ep_library(internode_ll_cuda internode_ll.cu)
+add_subdirectory(comm)
+add_subdirectory(driver)
 
-# Later, we should link all libraries in `EP_CUDA_LIBRARIES`
-set(EP_CUDA_LIBRARIES runtime_cuda layout_cuda intranode_cuda internode_cuda internode_ll_cuda PARENT_SCOPE)
+set(RUNTIME_CUDA_LIBRARIES runtime_comm runtime_driver CACHE INTERNAL "Runtime kernels")
