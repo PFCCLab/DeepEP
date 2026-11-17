@@ -6,7 +6,28 @@
 #include <cstdint>
 #include <nvtx3/nvToolsExt.h>
 
-Executor::Executor(int local_rank, int node_rank, std::string base_path, std::string comm_id, bool load_cached_kernels, bool enable_custom_allgather) : local_rank(local_rank), node_rank(node_rank), kernel_cache(node_rank, local_rank, base_path, comm_id, load_cached_kernels), enable_custom_allgather(enable_custom_allgather) {}  
+Executor::Executor(
+    int local_rank,
+    int node_rank,
+    std::string base_path,
+    std::string comm_id,
+    bool load_cached_kernels,
+    bool enable_custom_allgather,
+    std::string cuda_home,
+    std::string rdma_include_dir,
+    std::string rdma_library_dir)
+    : local_rank(local_rank),
+      node_rank(node_rank),
+      kernel_cache(
+          node_rank,
+          local_rank,
+          base_path,
+          comm_id,
+          load_cached_kernels,
+          cuda_home,
+          rdma_include_dir,
+          rdma_library_dir),
+      enable_custom_allgather(enable_custom_allgather) {}
 
 void Executor::set_intra_node_buffers(IntraNodeDispatchBuffers *intra_node_dispatch_buffers, IntraNodeCombineBuffers *intra_node_combine_buffers) {
     this->intra_node_dispatch_buffers = intra_node_dispatch_buffers;
@@ -28,10 +49,11 @@ torch::Tensor Executor::allgather_routing_map(
 ){
     nvtxRangePushA("allgather_routing_map in hybrid-ep");
 
-    auto torch_distributed = py::module_::import("torch.distributed");
+    // Import paddle.distributed directly (goes through paddle runtime, not torch)
+    auto paddle_distributed = py::module_::import("paddle.distributed");
     auto num_cols = local_routing_map.size(-1);  // E_total (sparse) or TOPK (dense)
     auto num_of_tokens_per_rank = local_routing_map.size(-2);
-    auto group_size = process_group.attr("size")().cast<int>();
+    auto group_size = process_group.attr("world_size").cast<int>();
     bool dense_routing = (config.topk > 0);
     // Custom allgather requires 16B-aligned payloads. Dense int16 routing falls back
     // to NCCL when num_tokens * TOPK * sizeof(int16_t) is not aligned.
@@ -55,9 +77,9 @@ torch::Tensor Executor::allgather_routing_map(
             // then reinterpret the gathered bytes through the int16 output tensor.
             auto local_as_bytes = local_routing_map.view(torch::kInt8);
             auto global_as_bytes = global_routing_map.view(torch::kInt8);
-            torch_distributed.attr("all_gather_into_tensor")(global_as_bytes, local_as_bytes, process_group);
+            paddle_distributed.attr("stream").attr("all_gather")(global_as_bytes, local_as_bytes, process_group, py::arg("sync_op") = true);
         } else {
-            torch_distributed.attr("all_gather_into_tensor")(global_routing_map, local_routing_map, process_group);
+            paddle_distributed.attr("stream").attr("all_gather")(global_routing_map, local_routing_map, process_group, py::arg("sync_op") = true);
         }
     } else { // At intra-node case, we will use custom allgather
         allgather_obj.launch(local_routing_map, /*NUM_OF_SMS=*/32, at::cuda::getCurrentCUDAStream());

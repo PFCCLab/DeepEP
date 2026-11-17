@@ -299,14 +299,21 @@ void NVLCoordinator::allocate_combine_buffers() {
 
 void NVLCoordinator::exchange_remote_nvl_info() {
     // Use Python's torch.distributed APIs through py::object
-    auto torch_distributed = py::module_::import("torch.distributed");
+    auto torch_distributed = py::module_::import("paddle.distributed");
     
     // Move tensors to CUDA for communication
-    auto dispatch_cuda = dispatch_memory_handles.cuda();
-    auto combine_cuda = combine_memory_handles.cuda();
+    // NOTE: copy explicitly instead of Tensor::cuda(), which is not reliable in Paddle's compat layer.
+    auto dispatch_cuda = torch::empty({dispatch_memory_handles.numel()},
+                                      torch::dtype(torch::kUInt8).device(torch::kCUDA));
+    CUDA_CHECK(cudaMemcpy(dispatch_cuda.data_ptr(), dispatch_memory_handles.data_ptr(),
+                          dispatch_memory_handles.numel(), cudaMemcpyHostToDevice));
+    auto combine_cuda = torch::empty({combine_memory_handles.numel()},
+                                     torch::dtype(torch::kUInt8).device(torch::kCUDA));
+    CUDA_CHECK(cudaMemcpy(combine_cuda.data_ptr(), combine_memory_handles.data_ptr(),
+                          combine_memory_handles.numel(), cudaMemcpyHostToDevice));
     
     // Get world size from process group
-    int world_size = process_group.attr("size")().cast<int>();
+    int world_size = process_group.attr("world_size").cast<int>();
     
     // Create empty tensors for allgather output
     py::list dispatch_output_list;

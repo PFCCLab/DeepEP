@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved
+import paddle
+paddle.enable_compat()
+
 import argparse
 import os
 
@@ -7,6 +10,7 @@ import torch
 import torch.distributed as dist
 
 import deep_ep
+from paddle.distributed import fleet
 
 from utils import init_dist
 
@@ -121,7 +125,7 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     _, _, group = init_dist(local_rank, num_local_ranks)
 
     num_of_ranks_per_node = args.num_processes
-    num_of_nodes = group.size() // num_of_ranks_per_node
+    num_of_nodes = group.world_size // num_of_ranks_per_node
     num_of_experts = NUM_LOCAL_EXPERTS * num_of_ranks_per_node * num_of_nodes
 
     for with_probs in [False, True]:
@@ -140,9 +144,24 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist.destroy_process_group()
 
 
+def init_dist_env(world_size, seed=20):
+    strategy = fleet.DistributedStrategy()
+    strategy.hybrid_configs = {
+        "dp_degree": 1,
+        "mp_degree": world_size,
+        "pp_degree": 1,
+        "sharding_degree": 1,
+    }
+    strategy.tensor_parallel_configs = {"tensor_init_seed": seed}
+    fleet.init(is_collective=True, strategy=strategy)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Test hybrid EP token drop in non-blocking mode')
     parser.add_argument('--num-processes', type=int, default=4,
                         help='Number of processes to spawn (default: 4)')
     args = parser.parse_args()
-    torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)
+    # Launch with `python -m paddle.distributed.launch tests/test_hybrid_ep_token_drop.py`.
+    if dist.get_world_size() > 1:
+        init_dist_env(dist.get_world_size())
+    test_main(dist.get_rank(), dist.get_world_size(), args)

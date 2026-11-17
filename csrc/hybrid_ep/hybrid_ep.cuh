@@ -7,9 +7,10 @@
 #include "utils.cuh"
 #include "executor/executor.cuh"
 #include "extension/allgather.cuh"
-#include <ATen/cuda/CUDAContext.h>
+// #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Optional.h>
-#include <torch/torch.h>
+// #include <torch/torch.h>
+#include <torch/python.h>
 #include <vector>
 #include <memory>
 #include <algorithm>
@@ -22,7 +23,10 @@
 
 class HybridEPBuffer {
 public:
-  HybridEPBuffer(pybind11::object process_group, BufferConfig config, int local_rank, int node_rank, int group_size, std::string base_path, bool load_cached_kernels, bool use_shared_buffer, bool enable_custom_allgather);
+  HybridEPBuffer(pybind11::object process_group, BufferConfig config, int local_rank, int node_rank, int group_size,
+                 std::string base_path, bool load_cached_kernels, bool use_shared_buffer,
+                 bool enable_custom_allgather, std::string cuda_home, std::string rdma_include_dir,
+                 std::string rdma_library_dir);
   ~HybridEPBuffer();
   bool update_buffer(HybridEpConfigInstance config); // True means the buffer is reallocated.
 

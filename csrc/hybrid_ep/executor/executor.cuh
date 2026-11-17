@@ -2,9 +2,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 #pragma once
-#include <ATen/cuda/CUDAContext.h>
+// #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Optional.h>
-#include <torch/torch.h>
+// #include <torch/torch.h>
+#include <torch/python.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include "utils.cuh"
 #include "hybrid_ep_backend.cuh"
@@ -47,7 +49,9 @@ struct HandleImpl {
 
 class Executor {
 public:
-    Executor(int local_rank, int node_rank, std::string base_path, std::string comm_id, bool load_cached_kernels, bool enable_custom_allgather);
+    Executor(int local_rank, int node_rank, std::string base_path, std::string comm_id,
+             bool load_cached_kernels, bool enable_custom_allgather, std::string cuda_home,
+             std::string rdma_include_dir, std::string rdma_library_dir);
 
     struct DispatchArgs {
         // Input tensors

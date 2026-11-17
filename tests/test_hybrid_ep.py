@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved
+import paddle
+paddle.enable_compat()
+
 import argparse
 import time
 import torch
@@ -7,6 +10,8 @@ import torch.distributed as dist
 import os
 import deep_ep
 import hybrid_ep_cpp
+from paddle.distributed import fleet
+from paddle.distributed.communication.group import Group
 
 from utils import TorchRef, bench, bench_kineto, init_dist, count_rdma_send_from_routing_map
 
@@ -31,8 +36,6 @@ NUM_BLOCKS_UNPERMUTE = _optional_int("NUM_BLOCKS_UNPERMUTE")
 torch.manual_seed(SEED)
 torch.cuda.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 # Will be set after the process group is initialized
 NUM_OF_RANKS_PER_NODE = None
 NUM_OF_NODES = None
@@ -97,8 +100,8 @@ def init_tensor(
             high=256,
             size=(seq_len, hidden_dim),
             device="cuda",
-            dtype=torch.uint8,
-        )
+            dtype=torch.int32,
+        ).to(torch.uint8)
     else:
         hidden = torch.randn(seq_len, hidden_dim, device="cuda", dtype=torch.bfloat16)
     probs = torch.zeros(seq_len, num_of_experts, device="cuda", dtype=torch.float32)
@@ -186,14 +189,14 @@ def test_hybrid_ep_correctness(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, us
             local_expert_routing_map = local_expert_routing_map[
                 : num_dispatched_tokens.item()
             ]
-            copy_times = local_expert_routing_map.sum(dim=1)
+            copy_times = local_expert_routing_map.sum(dim=1).to(torch.bfloat16)
             hidden_to_combine = dispatched_hidden_dense.to(torch.bfloat16) * copy_times.unsqueeze(1)
             combined_hidden, combined_probs = buffer.combine(
                 hidden_to_combine, dispatched_probs_dense, handle_dense
             )
             combined_hidden = combined_hidden / TOPK
 
-            assert torch.allclose(combined_hidden, hidden.to(torch.bfloat16), atol=2e-5, rtol=1e-2), \
+            assert torch.allclose(combined_hidden.to(torch.float32), hidden.to(torch.bfloat16).to(torch.float32), atol=2e-5, rtol=1e-2), \
                 f"Combine hidden mismatch{context}"
             if combined_probs is not None and probs is not None:
                 assert_bitwise_equal("Combine probs", probs, combined_probs, context)
@@ -269,7 +272,7 @@ def test_hybrid_ep_correctness(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, us
                 combined_hidden = combined_hidden / TOPK
 
                 assert torch.allclose(
-                    combined_hidden, hidden.to(torch.bfloat16), atol=2e-5, rtol=1e-2
+                    combined_hidden.to(torch.float32), hidden.to(torch.bfloat16).to(torch.float32), atol=2e-5, rtol=1e-2
                 ), f"Combine+unpermute hidden mismatch{context}"
                 if combined_probs is not None and probs is not None:
                     assert_bitwise_equal("Combine+unpermute probs", probs, combined_probs, context)
@@ -338,7 +341,7 @@ def _report_kineto(dispatch_label, combine_label, dispatch_t, dispatch_bytes, co
                   f'avg_t={c_avg * 1e6:.1f} us [min={c_min * 1e6:.1f}, max={c_max * 1e6:.1f}]', flush=True)
 
 
-def test_hybrid_ep_benchmark(buffer: deep_ep.HybridEPBuffer, group: dist.ProcessGroup, use_fp8: bool, nsys_profile: bool):
+def test_hybrid_ep_benchmark(buffer: deep_ep.HybridEPBuffer, group: Group, use_fp8: bool, nsys_profile: bool):
     hidden, probs, scaling_factor, routing_map, topk_idx, topk_weights = init_tensor(
         hidden_dim=HIDDEN_DIM,
         seq_len=NUM_TOKENS_PER_RANK,
@@ -439,14 +442,17 @@ def test_hybrid_ep_benchmark(buffer: deep_ep.HybridEPBuffer, group: dist.Process
 
     # ---- Kineto / nsys profiling ----
     # Kineto measures pure GPU kernel time only (no CPU overhead, no d2d, no device_sync)
-    if not nsys_profile:
+    if not nsys_profile and not hasattr(torch.profiler, "profile"):
+        if rank == 0:
+            print(f'\n=== Kernel Benchmark ({dtype_str}): SKIP (torch.profiler.profile is unavailable) ===', flush=True)
+    elif not nsys_profile:
         if rank == 0:
             print(f'\n=== Kernel Benchmark ({dtype_str}, {dist.get_world_size()} ranks) ===', flush=True)
             print(f'  Non-fused:  dispatch_kernel only  |  combine_kernel only', flush=True)
             print(f'  Fused:      fused_permute_dispatch_kernel only  |  fused_combine_unpermute_kernel only', flush=True)
 
         # Non-fused kernel profiling (probs=True)
-        group.barrier()
+        dist.barrier(group)
         dispatch_t, combine_t = bench_kineto(
             lambda: (buffer.dispatch(**dispatch_args), buffer.combine(**combine_args)),
             kernel_names=('dispatch_kernel', 'combine_kernel'), barrier_comm_profiling=True, suppress_kineto_output=True)
@@ -454,7 +460,7 @@ def test_hybrid_ep_benchmark(buffer: deep_ep.HybridEPBuffer, group: dist.Process
                        dispatch_t, nvl_dispatch_actual, combine_t, nvl_combine, rdma_dispatch, rdma_combine)
 
         # Non-fused kernel profiling (probs=False)
-        group.barrier()
+        dist.barrier(group)
         dispatch_t, combine_t = bench_kineto(
             lambda: (buffer.dispatch(**dispatch_noprob_args), buffer.combine(**combine_noprob_args)),
             kernel_names=('dispatch_kernel', 'combine_kernel'), barrier_comm_profiling=True, suppress_kineto_output=True)
@@ -462,7 +468,7 @@ def test_hybrid_ep_benchmark(buffer: deep_ep.HybridEPBuffer, group: dist.Process
                        dispatch_t, nvl_dispatch_actual, combine_t, nvl_combine, rdma_dispatch, rdma_combine)
 
         # Fused kernel profiling
-        group.barrier()
+        dist.barrier(group)
         dispatch_t, combine_t = bench_kineto(
             lambda: (buffer.dispatch_with_permute(**dispatch_fused_args), buffer.combine_with_unpermute(**combine_fused_args)),
             kernel_names=('dispatch_kernel', 'combine_kernel'), barrier_comm_profiling=True, suppress_kineto_output=True)
@@ -470,7 +476,7 @@ def test_hybrid_ep_benchmark(buffer: deep_ep.HybridEPBuffer, group: dist.Process
                        dispatch_t, nvl_dispatch_actual, combine_t, nvl_combine, rdma_dispatch, rdma_combine)
 
         # Non-fused permute/unpermute kernel profiling (isolate permute_kernel and unpermute_kernel times)
-        group.barrier()
+        dist.barrier(group)
         dispatch_t, permute_t = bench_kineto(
             lambda: buffer.dispatch_with_permute(**dispatch_wp_args),
             kernel_names=('dispatch_kernel', 'permute_kernel'), barrier_comm_profiling=True, suppress_kineto_output=True)
@@ -489,7 +495,7 @@ def test_hybrid_ep_benchmark(buffer: deep_ep.HybridEPBuffer, group: dist.Process
             print(f'  {"combine_kernel (in combine+unpermute):":<{LOG_LABEL_WIDTH}} {fmt(c_times)}', flush=True)
     else:
         if torch.distributed.get_rank() == 0:
-            torch.cuda.profiler.start()
+            paddle.base.core.nvprof_start()
         with torch.cuda.nvtx.range(f"hybrid-ep dispatch ({dtype_str}, probs=True)"):
             if rank == 0:
                 print(f"profile hybrid-ep dispatch ({dtype_str}, probs=True)", flush=True)
@@ -519,14 +525,15 @@ def test_hybrid_ep_benchmark(buffer: deep_ep.HybridEPBuffer, group: dist.Process
             bench(lambda: buffer.combine_with_unpermute(**combine_fused_args))
         time.sleep(1)
         if torch.distributed.get_rank() == 0:
-            torch.cuda.profiler.stop()
+            paddle.base.core.nvprof_stop()
 
 
 def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     _, _, group = init_dist(local_rank, num_local_ranks)
 
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
+    # Paddle runs the test on the default stream: HybridEP picks the current
+    # stream from the framework, and a side stream is not needed here.
+    if True:
         fp8_modes = [False] if args.only_bf16 else [False, True]
         for use_fp8 in fp8_modes:
             buffer = deep_ep.HybridEPBuffer(
@@ -550,7 +557,7 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             NUM_OF_RANKS_PER_NODE = buffer.num_of_hybrid_ep_ranks_per_nvlink_domain
             NUM_OF_NODES = buffer.num_of_nodes
             NUM_OF_EXPERTS = NUM_LOCAL_EXPERTS * NUM_OF_RANKS_PER_NODE * NUM_OF_NODES
-            if group.rank() == 0:
+            if group.rank == 0:
                 # Surface the topology: if it is ever wrong, the symptom is an
                 # expert-slicing mismatch, which is a confusing way to find out.
                 print(f"[topology] ranks_per_nvlink_domain={NUM_OF_RANKS_PER_NODE} "
@@ -569,6 +576,19 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist.barrier()
     dist.destroy_process_group()
 
+
+def init_dist_env(world_size, seed=20):
+    strategy = fleet.DistributedStrategy()
+    strategy.hybrid_configs = {
+        "dp_degree": 1,
+        "mp_degree": world_size,
+        "pp_degree": 1,
+        "sharding_degree": 1,
+    }
+    strategy.tensor_parallel_configs = {"tensor_init_seed": seed}
+    fleet.init(is_collective=True, strategy=strategy)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Test intranode EP kernels')
     parser.add_argument('--num-processes', type=int, default=4,
@@ -578,4 +598,7 @@ if __name__ == "__main__":
     parser.add_argument('--only-bf16', action='store_true', default=False,
                        help='Skip FP8 tests, only run BF16 (default: False)')
     args = parser.parse_args()
-    torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)
+    # Launch with `python -m paddle.distributed.launch tests/test_hybrid_ep.py`.
+    if dist.get_world_size() > 1:
+        init_dist_env(dist.get_world_size())
+    test_main(dist.get_rank(), dist.get_world_size(), args)

@@ -16,7 +16,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "HybridEP, efficiently enable the expert-parallel communication in "
               "the Hopper+ architectures";
     
-    pybind11::class_<ExtendedMemoryAllocator>(m, "ExtendedMemoryAllocator")
+    pybind11::class_<ExtendedMemoryAllocator>(m, "ExtendedMemoryAllocator", py::module_local())
         .def(py::init<>())
         .def("detect_accessible_ranks", &ExtendedMemoryAllocator::detect_accessible_ranks, py::arg("process_group"));
       
@@ -28,7 +28,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("__str__",
              [](const APP_TOKEN_DATA_TYPE &type) { return type_to_string(type); });
   
-    pybind11::class_<BufferConfig>(m, "BufferConfig")
+    pybind11::class_<BufferConfig>(m, "BufferConfig", py::module_local())
         .def(py::init<>())
         .def_readwrite("hidden_dim", &BufferConfig::hidden_dim)
         .def_readwrite("max_num_of_tokens_per_rank", &BufferConfig::max_num_of_tokens_per_rank)
@@ -61,7 +61,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                  " num_of_combine_chunks=" + std::to_string(config.num_of_combine_chunks) + ">";
         });
 
-    pybind11::class_<HybridEpConfigInstance>(m, "HybridEpConfigInstance")
+    pybind11::class_<HybridEpConfigInstance>(m, "HybridEpConfigInstance", py::module_local())
         .def(py::init<>())
         // Hybrid-ep Config
         .def_readwrite("hidden_dim", &HybridEpConfigInstance::hidden_dim)
@@ -133,7 +133,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                  ">";
         });
 
-    pybind11::class_<Configurer>(m, "Configurer")
+    pybind11::class_<Configurer>(m, "Configurer", py::module_local())
         .def(py::init<int, int, int, int, int, bool,
                       std::optional<int>, std::optional<int>, std::optional<int>,
                       std::optional<int>, std::optional<int>>(),
@@ -155,7 +155,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("config"),
             py::arg("fuse_permute_dispatch") = false);
 
-    pybind11::class_<HandleImpl>(m, "HandleImpl")
+    pybind11::class_<HandleImpl>(m, "HandleImpl", py::module_local())
         .def(py::init<>())
         .def_readwrite("sparse_to_dense_map", &HandleImpl::sparse_to_dense_map)
         .def_readwrite("rdma_to_attn_map", &HandleImpl::rdma_to_attn_map)
@@ -172,8 +172,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("dense_chunk_layout", &HandleImpl::dense_chunk_layout)
         .def_readwrite("dense_to_expert_map", &HandleImpl::dense_to_expert_map);
 
-    pybind11::class_<HybridEPBuffer>(m, "HybridEPBuffer")
-        .def(py::init<py::object, BufferConfig, int, int, int, std::string, bool, bool, bool>(),
+    pybind11::class_<HybridEPBuffer>(m, "HybridEPBuffer", py::module_local())
+        .def(py::init<py::object, BufferConfig, int, int, int, std::string, bool, bool, bool, std::string, std::string, std::string>(),
             py::arg("process_group"),
             py::arg("config"),
             py::arg("local_rank"),
@@ -182,7 +182,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("base_path"),
             py::arg("load_cached_kernels") = false,
             py::arg("use_shared_buffer") = true,
-            py::arg("enable_custom_allgather") = true)
+            py::arg("enable_custom_allgather") = true,
+            py::arg("cuda_home") = "",
+            py::arg("rdma_include_dir") = "",
+            py::arg("rdma_library_dir") = "")
         .def_readonly("buffer_generation", &HybridEPBuffer::buffer_generation)
         .def("update_buffer", &HybridEPBuffer::update_buffer, py::arg("config"))
         .def("metadata_preprocessing", &HybridEPBuffer::metadata_preprocessing,

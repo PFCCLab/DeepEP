@@ -9,6 +9,9 @@ reference is the uniform-count TorchRef fed with locally zero-padded inputs:
 pad rows route nowhere, so the reference outputs are exactly the expected
 ragged outputs.
 """
+import paddle
+paddle.enable_compat()
+
 import argparse
 import os
 
@@ -16,6 +19,7 @@ import torch
 import torch.distributed as dist
 
 import deep_ep
+from paddle.distributed import fleet
 
 from utils import TorchRef, init_dist
 
@@ -71,16 +75,16 @@ def init_ragged_tensor(
     seed: int,
 ):
     """Build per-rank inputs with num_valid rows, each routed to topk experts."""
-    gen = torch.Generator(device="cuda")
-    gen.manual_seed(seed)
+    # Paddle's random ops take no generator argument; reseed the global RNG instead.
+    torch.manual_seed(seed)
     if use_fp8:
         hidden = torch.randint(
             low=0, high=256, size=(num_valid, hidden_dim),
-            device="cuda", dtype=torch.uint8, generator=gen,
-        )
+            device="cuda", dtype=torch.int32,
+        ).to(torch.uint8)
     else:
-        hidden = torch.randn(num_valid, hidden_dim, device="cuda", dtype=torch.bfloat16, generator=gen)
-    scaling_factor = torch.randn(num_valid, hidden_dim // 128, device="cuda", dtype=torch.float32, generator=gen)
+        hidden = torch.randn(num_valid, hidden_dim, device="cuda", dtype=torch.bfloat16)
+    scaling_factor = torch.randn(num_valid, hidden_dim // 128, device="cuda", dtype=torch.float32)
 
     probs = torch.zeros(num_valid, num_of_experts, device="cuda", dtype=torch.float32)
     routing_map = torch.zeros(num_valid, num_of_experts, device="cuda", dtype=torch.bool)
@@ -88,7 +92,7 @@ def init_ragged_tensor(
     topk_weights = torch.zeros(num_valid, topk, device="cuda", dtype=torch.float32)
 
     for i in range(num_valid):
-        selected = torch.randperm(num_of_experts, device="cuda", generator=gen)[:topk]
+        selected = torch.randperm(num_of_experts, device="cuda")[:topk]
         topk_idx[i, :] = selected.to(torch.int64)
         topk_weights[i, :] = 1.0
         routing_map[i, selected] = True
@@ -201,7 +205,7 @@ def test_ragged_dispatch_combine(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, 
                 f"num_dispatched_tokens{context}: expected {ref_hidden.shape[0]}, got {num_dispatched}"
             )
 
-            copy_times = local_expert_routing_map[:num_dispatched].sum(dim=1)
+            copy_times = local_expert_routing_map[:num_dispatched].sum(dim=1).to(torch.bfloat16)
             hidden_to_combine = dispatched_hidden.to(torch.bfloat16) * copy_times.unsqueeze(1)
             combined, combined_probs = buffer.combine(hidden_to_combine, dispatched_probs, handle)
             check_combined("Ragged combine hidden", combined, hidden, routing_map, context)
@@ -361,7 +365,7 @@ def test_zero_token_rank(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, use_fp8:
 
     num_dispatched, local_expert_routing_map = handle[3], handle[4]
     num_dispatched = int(num_dispatched.cpu().item())
-    copy_times = local_expert_routing_map[:num_dispatched].sum(dim=1)
+    copy_times = local_expert_routing_map[:num_dispatched].sum(dim=1).to(torch.bfloat16)
     combined, combined_probs = buffer.combine(
         dispatched_hidden.to(torch.bfloat16) * copy_times.unsqueeze(1), masked, handle
     )
@@ -438,7 +442,7 @@ def test_uniform_unaligned_default(buffer: deep_ep.HybridEPBuffer, ref: TorchRef
 
     num_dispatched, local_expert_routing_map = handle[3], handle[4]
     num_dispatched = int(num_dispatched.cpu().item())
-    copy_times = local_expert_routing_map[:num_dispatched].sum(dim=1)
+    copy_times = local_expert_routing_map[:num_dispatched].sum(dim=1).to(torch.bfloat16)
     combined, combined_probs = buffer.combine(
         dispatched_hidden.to(torch.bfloat16) * copy_times.unsqueeze(1), masked, handle
     )
@@ -496,7 +500,7 @@ def test_stale_handle_rejected(buffer: deep_ep.HybridEPBuffer, ref: TorchRef):
     # The post-growth handle still works end to end.
     num_dispatched, lerm = handle2[3], handle2[4]
     num_dispatched = int(num_dispatched.cpu().item())
-    copy_times = lerm[:num_dispatched].sum(dim=1)
+    copy_times = lerm[:num_dispatched].sum(dim=1).to(torch.bfloat16)
     start, end = ref._local_expert_range_per_node()
     masked = torch.zeros_like(disp_probs2)
     masked[:, start:end] = disp_probs2[:, start:end]
@@ -512,8 +516,8 @@ def test_stale_handle_rejected(buffer: deep_ep.HybridEPBuffer, ref: TorchRef):
 def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     _, _, group = init_dist(local_rank, num_local_ranks)
 
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
+    # Paddle runs the test on the default stream.
+    if True:
         fp8_modes = [False] if args.only_bf16 else [False, True]
         for use_fp8 in fp8_modes:
             buffer = deep_ep.HybridEPBuffer(
@@ -533,7 +537,7 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             NUM_OF_RANKS_PER_NODE = buffer.num_of_hybrid_ep_ranks_per_nvlink_domain
             NUM_OF_NODES = buffer.num_of_nodes
             NUM_OF_EXPERTS = NUM_LOCAL_EXPERTS * NUM_OF_RANKS_PER_NODE * NUM_OF_NODES
-            if group.rank() == 0:
+            if group.rank == 0:
                 # Surface the topology: if it is ever wrong, the symptom is an
                 # expert-slicing mismatch, which is a confusing way to find out.
                 print(f"[topology] ranks_per_nvlink_domain={NUM_OF_RANKS_PER_NODE} "
@@ -559,9 +563,24 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist.destroy_process_group()
 
 
+def init_dist_env(world_size, seed=20):
+    strategy = fleet.DistributedStrategy()
+    strategy.hybrid_configs = {
+        "dp_degree": 1,
+        "mp_degree": world_size,
+        "pp_degree": 1,
+        "sharding_degree": 1,
+    }
+    strategy.tensor_parallel_configs = {"tensor_init_seed": seed}
+    fleet.init(is_collective=True, strategy=strategy)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test ragged (unequal per-rank token count) HybridEP")
     parser.add_argument("--num-processes", type=int, default=4)
     parser.add_argument("--only-bf16", action="store_true", default=False)
     args = parser.parse_args()
-    torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)
+    # Launch with `python -m paddle.distributed.launch tests/test_ragged_hybrid_ep.py`.
+    if dist.get_world_size() > 1:
+        init_dist_env(dist.get_world_size())
+    test_main(dist.get_rank(), dist.get_world_size(), args)

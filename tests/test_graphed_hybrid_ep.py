@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved
+import paddle
+paddle.enable_compat()
+
 import argparse
 import time
 import torch
 import torch.distributed as dist
 import os
 import deep_ep
+from paddle.distributed import fleet
 
 from utils import TorchRef, bench, bench_kineto, init_dist, count_rdma_send_from_routing_map
 
@@ -21,8 +25,6 @@ SEED = int(os.environ.get("SEED", 42))
 torch.manual_seed(SEED)
 torch.cuda.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 # Will be set after the process group is initialized
 NUM_OF_RANKS_PER_NODE = None
 NUM_OF_NODES = None
@@ -57,8 +59,8 @@ def init_tensor(
             high=256,
             size=(seq_len, hidden_dim),
             device="cuda",
-            dtype=torch.uint8,
-        )
+            dtype=torch.int32,
+        ).to(torch.uint8)
     else:
         hidden = torch.randn(seq_len, hidden_dim, device="cuda", dtype=torch.bfloat16)
     probs = torch.zeros(seq_len, num_of_experts, device="cuda", dtype=torch.float32)
@@ -171,7 +173,7 @@ def test_hybrid_ep_correctness(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, us
         ), f"Dispatch scaling_factor mismatch (with_probs={with_probs}, fused={fused_permute_dispatch})"
     reconstructed_hidden = graph_combined_hidden / TOPK
     assert torch.allclose(
-        reconstructed_hidden, hidden.to(torch.bfloat16), atol=2e-5, rtol=1e-2
+        reconstructed_hidden.to(torch.float32), hidden.to(torch.bfloat16).to(torch.float32), atol=2e-5, rtol=1e-2
     ), f"Combine hidden mismatch (with_probs={with_probs}, fused={fused_permute_dispatch})"
     if with_probs:
         assert bitwise_equal(graph_combined_probs, probs), \
@@ -182,10 +184,13 @@ def test_hybrid_ep_correctness(buffer: deep_ep.HybridEPBuffer, ref: TorchRef, us
     print_in_order(f'[rank {dist.get_rank()}] Correctness check passed ({dtype_str}, with_probs={with_probs}, {fused_str})')
 
     # Benchmark the graphed hybrid ep in nsys profile
-    torch.cuda.profiler.start()
+    paddle.base.core.nvprof_start()
     for _ in range(ITERATIONS):
         graph.replay()
-    torch.cuda.profiler.stop()
+    paddle.base.core.nvprof_stop()
+    # Paddle frees the graph's memory pool when the graph is destroyed on return,
+    # so wait for the replays to finish before it goes out of scope.
+    torch.cuda.synchronize()
 
 
 def test_plain_dispatch_capture(buffer: deep_ep.HybridEPBuffer):
@@ -264,7 +269,7 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 NUM_OF_RANKS_PER_NODE = buffer.num_of_hybrid_ep_ranks_per_nvlink_domain
                 NUM_OF_NODES = buffer.num_of_nodes
                 NUM_OF_EXPERTS = NUM_LOCAL_EXPERTS * NUM_OF_RANKS_PER_NODE * NUM_OF_NODES
-                if group.rank() == 0:
+                if group.rank == 0:
                     # Surface the topology: if it is ever wrong, the symptom is
                     # an expert-slicing mismatch, a confusing way to find out.
                     print(f"[topology] ranks_per_nvlink_domain={NUM_OF_RANKS_PER_NODE} "
@@ -285,9 +290,25 @@ def test_main(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist.barrier()
     dist.destroy_process_group()
 
+
+def init_dist_env(world_size, seed=20):
+    strategy = fleet.DistributedStrategy()
+    strategy.hybrid_configs = {
+        "dp_degree": 1,
+        "mp_degree": world_size,
+        "pp_degree": 1,
+        "sharding_degree": 1,
+    }
+    strategy.tensor_parallel_configs = {"tensor_init_seed": seed}
+    fleet.init(is_collective=True, strategy=strategy)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Test intranode EP kernels')
     parser.add_argument('--num-processes', type=int, default=4,
                        help='Number of processes to spawn (default: 4)')
     args = parser.parse_args()
-    torch.multiprocessing.spawn(test_main, args=(args.num_processes, args), nprocs=args.num_processes)
+    # Launch with `python -m paddle.distributed.launch tests/test_graphed_hybrid_ep.py`.
+    if dist.get_world_size() > 1:
+        init_dist_env(dist.get_world_size())
+    test_main(dist.get_rank(), dist.get_world_size(), args)
