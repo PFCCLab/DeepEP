@@ -240,12 +240,16 @@ hybrid_dispatch_impl(
                 const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
                     return workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_peer_idx, i);
                 }, false, [=](const int& scaleout_peer_idx, const int& decoded) {
-                    // The deterministic mode needs the counts split by source rank, since every
-                    // source rank owns a private row in the destination's scale-up buffer
+                    // Deterministic mode: also forward this count per source rank. The source is
+                    // global rank `r = scaleout_peer_idx * kNumScaleupRanks + scaleup_rank_idx` (same
+                    // rail as this rank), which owns a private row in peer `i`'s scale-up buffer; the
+                    // copy epilogue uses these per-row counts to find where each row ends
+                    // NOTES: the slot is indexed by `r` because the epilogue traverses rows in `r` order,
+                    // see `kRowForm` in `dispatch_copy_epilogue.cuh`
                     if constexpr (kDeterministic) {
                         gin.put_value<ncclTeamTagLsa>(
                             workspace_layout.get_deterministic_src_rank_count_ptr(
-                                scaleup_rank_idx * kNumScaleoutRanks + scaleout_peer_idx),
+                                scaleout_peer_idx * kNumScaleupRanks + scaleup_rank_idx),
                             math::encode_decode_positive(decoded), i);
                     }
                 });

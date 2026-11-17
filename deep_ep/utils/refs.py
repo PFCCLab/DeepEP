@@ -142,11 +142,16 @@ def generate_pre_combine_data(src_token_global_idx: torch.Tensor,
     - Generated data, `[num_tokens, num_topk, hidden]`
     """
     num_ranks = dist.get_world_size()
-    # NOTE(paddle-compat): paddle compat does not auto-promote int32*int64;
-    # align arange dtype with `src_token_global_idx` to avoid a type-promotion error.
-    token_seeds = (src_token_global_idx.unsqueeze(1) * num_topk +
+    # NOTES: `token_seeds * 131071` overflows int32 as soon as the shape is large (it reaches 5.2e10
+    # at 4096 tokens per rank with 16 ranks and top-k 6), and the callers disagree on the index
+    # dtype: the reference path passes an int64 `arange` while the dispatch path passes the int32
+    # `recv_src_metadata` column, so an int32 computation silently generates different data for the
+    # two sides. Do the index arithmetic in int64 on both.
+    # NOTE(paddle-compat): paddle compat does not auto-promote int32*int64, so cast explicitly
+    # instead of relying on the `arange` dtype to promote the expression.
+    token_seeds = (src_token_global_idx.unsqueeze(1).to(torch.int64) * num_topk +
                    torch.arange(num_topk, device=src_token_global_idx.device,
-                                dtype=src_token_global_idx.dtype).unsqueeze(0))  # [num_tokens, num_topk]
+                                dtype=torch.int64).unsqueeze(0))  # [num_tokens, num_topk]
     max_seed = num_ranks * num_max_tokens_per_rank * num_topk
     result = torch.sin(
         (((token_seeds * 131071 % max_seed).float() + 1) / max_seed).unsqueeze(-1) *
