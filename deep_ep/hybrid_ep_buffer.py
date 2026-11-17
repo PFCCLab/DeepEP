@@ -3,8 +3,14 @@
 import torch
 import os
 import shutil
-import hybrid_ep_cpp
 import warnings
+import contextlib
+from paddle.distributed.communication.group import Group
+
+from .runtime_paths import configure_runtime_paths, detect_runtime_paths
+
+configure_runtime_paths()
+import hybrid_ep_cpp
 
 INT16_EXPERT_LIMIT = torch.iinfo(torch.int16).max + 1
 DENSE_ROUTING_EXPERTS_PER_RANK_LIMIT = 512
@@ -57,10 +63,18 @@ def dense_indices_to_probs(
     return probs
 
 
+def _nvtx_range(message: str):
+    nvtx = getattr(torch.cuda, "nvtx", None)
+    nvtx_range = getattr(nvtx, "range", None)
+    if nvtx_range is None:
+        return contextlib.nullcontext()
+    return nvtx_range(message)
+
+
 class HybridEPBuffer:
     def __init__(
         self,
-        group: torch.distributed.ProcessGroup,
+        group: Group,
         # Parameters for the hybrid-ep buffer allocation
         hidden_dim: int,
         max_num_of_tokens_per_rank: int,
@@ -81,13 +95,17 @@ class HybridEPBuffer:
         use_mnnvl: bool = None
     ):
         self.group = group
-        self.rank = self.group.rank()
-        self.group_size = self.group.size()
+        self.rank = self.group.rank
+        self.group_size = self.group.world_size
 
         allocator = hybrid_ep_cpp.ExtendedMemoryAllocator()
         detected_ranks = allocator.detect_accessible_ranks(self.group)
         env_value = os.getenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN")
-        if env_value is not None:
+        if num_of_hybrid_ep_ranks_per_nvlink_domain is not None:
+            self.num_of_hybrid_ep_ranks_per_nvlink_domain = int(
+                num_of_hybrid_ep_ranks_per_nvlink_domain
+            )
+        elif env_value is not None:
             self.num_of_hybrid_ep_ranks_per_nvlink_domain = int(env_value)
             if self.num_of_hybrid_ep_ranks_per_nvlink_domain != detected_ranks:
                 warnings.warn(
@@ -122,6 +140,7 @@ class HybridEPBuffer:
             num_blocks_unpermute=num_blocks_unpermute,
         )
 
+        runtime_paths = detect_runtime_paths()
         # Create C++ buffer - this will allocate all buffers during construction
         self.runtime = hybrid_ep_cpp.HybridEPBuffer(
             self.group,
@@ -133,6 +152,9 @@ class HybridEPBuffer:
             load_cached_kernels=load_cached_kernels,
             use_shared_buffer=use_shared_buffer,
             enable_custom_allgather=enable_custom_allgather,
+            cuda_home=runtime_paths.cuda_home or "",
+            rdma_include_dir=runtime_paths.rdma_include_dir or "",
+            rdma_library_dir=runtime_paths.rdma_library_dir or "",
         )
 
     def empty_jit_cache(self):
@@ -562,7 +584,7 @@ class HybridEPBuffer:
             warnings.warn("The use_host_meta is deprecated, it will be removed in the future.")
             non_blocking = not use_host_meta
 
-        with torch.cuda.nvtx.range("hybrid-ep dispatch with permute phase"):
+        with _nvtx_range("hybrid-ep dispatch with permute phase"):
             num_of_valid_tokens, hidden_dim = hidden.shape
             topk, routing_data, probs, _ = self._prepare_routing_data(
                 topk_idx=topk_idx,
@@ -685,7 +707,7 @@ class HybridEPBuffer:
         if num_dispatched_tokens is not None:
             warnings.warn("The num_dispatched_tokens is deprecated, it will be removed in the future.")
 
-        with torch.cuda.nvtx.range("hybrid-ep combine with unpermute phase"):
+        with _nvtx_range("hybrid-ep combine with unpermute phase"):
             assert self.configurer is not None, "Please initialize the configurer first."
             assert handle is not None, "The handle is necessary in the combine pass."
 

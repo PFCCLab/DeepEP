@@ -240,7 +240,7 @@ void NIXLCoordinator::allocate_buffers() {
         dispatch_buffers,
         combine_buffers);
 
-    auto torch_distributed = pybind11::module_::import("torch.distributed");
+    auto torch_distributed = pybind11::module_::import("paddle.distributed");
     torch_distributed.attr("barrier")(this->process_group);
 
     // sendLocalMD is async — metadata publication to etcd happens in a background

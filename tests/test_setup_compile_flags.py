@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 
-SETUP_PATH = Path(__file__).resolve().parents[1] / "setup.py"
+SETUP_PATH = Path(__file__).resolve().parents[1] / "setup_hybrid_ep.py"
 
 
 def get_hardcoded_cxx_standard_flags(function_name: str):
@@ -25,11 +25,11 @@ def get_hardcoded_cxx_standard_flags(function_name: str):
 
 
 class TestSetupCompileFlags(unittest.TestCase):
-    def test_hybrid_ep_inherits_torch_cxx_standard(self):
+    def test_hybrid_ep_inherits_framework_cxx_standard(self):
         self.assertEqual(
             get_hardcoded_cxx_standard_flags("get_extension_hybrid_ep_cpp"),
             [],
-            "hybrid_ep_cpp must inherit the C++ standard selected by PyTorch",
+            "hybrid_ep_cpp must inherit the C++ standard selected by Paddle",
         )
 
 

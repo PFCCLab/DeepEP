@@ -37,11 +37,23 @@ std::string get_jit_dir() {
     return proc_jit;
 }
 
-NVCCCompiler::NVCCCompiler(std::string base_path, std::string comm_id): 
+NVCCCompiler::NVCCCompiler(
+    std::string base_path,
+    std::string comm_id,
+    std::string cuda_home,
+    std::string rdma_include_dir,
+    std::string rdma_library_dir):
     base_path(base_path), comm_id(comm_id) {
     jit_dir = get_jit_dir();
 
-    nvcc_path = get_env("CUDA_HOME") + "/bin/nvcc";
+    // The CUDA toolkit is resolved on the Python side (deep_ep/runtime_paths.py),
+    // so the JIT does not depend on CUDA_HOME being exported.
+    if (cuda_home.empty() || !std::filesystem::exists(cuda_home + "/bin/nvcc") ||
+        !std::filesystem::exists(cuda_home + "/include/cuda_runtime.h")) {
+        throw std::runtime_error(
+            "Failed to locate CUDA for HybridEP JIT. Pass a valid cuda_home from Python.");
+    }
+    nvcc_path = cuda_home + "/bin/nvcc";
 
     // Init the flags to compiler
     std::string sm_arch_flags = convert_to_nvcc_arch_flags(SM_ARCH);
@@ -50,9 +62,9 @@ NVCCCompiler::NVCCCompiler(std::string base_path, std::string comm_id):
             " -Xcompiler -fPIC -shared ";
     // Add the include path of the hybrid-ep library
     std::string include = " -I" + base_path + "/backend" 
-            + " -I" + get_env("CUDA_HOME") + "/include ";
+            + " -I" + cuda_home + "/include ";
     // Add the library path of the hybrid-ep library
-    std::string library = "-L" + get_env("CUDA_HOME") + "/lib64 -lcudart ";
+    std::string library = "-L" + cuda_home + "/lib64 -lcudart ";
 
     intra_node_flags = flags + " " + include + " " + library;
 
@@ -82,11 +94,12 @@ NVCCCompiler::NVCCCompiler(std::string base_path, std::string comm_id):
     library += " -L" + nixl_lib + " -lnixl -lnixl_build -lnixl_common ";
     library += " -Xlinker -rpath -Xlinker " + nixl_lib + " ";
 #else
-    std::string rdma_core_home = RDMA_CORE_HOME;
-    if (!rdma_core_home.empty()) {
-        include += " -I" + rdma_core_home + "/include ";
-        library += " -L" + rdma_core_home + "/lib ";
+    if (rdma_include_dir.empty() || rdma_library_dir.empty()) {
+        throw std::runtime_error(
+            "Failed to locate RDMA core headers/libs for HybridEP JIT. Pass valid RDMA paths from Python.");
     }
+    include += " -I" + rdma_include_dir + " ";
+    library += " -L" + rdma_library_dir + " ";
     include += " -I" + base_path + "/backend/nccl/include ";
     library += " -lmlx5 -libverbs ";
     std::string doca_obj_path = base_path + "/backend/nccl/obj";
@@ -274,8 +287,16 @@ std::string NVCCCompiler::get_combine_code(HybridEpConfigInstance config) {
       )";
 }
 
-KernelCache::KernelCache(int node_rank, int local_rank, std::string base_path, std::string comm_id, bool load_cached_kernels): 
-node_rank(node_rank), local_rank(local_rank), nvcc_compiler(base_path, comm_id) {
+KernelCache::KernelCache(
+    int node_rank,
+    int local_rank,
+    std::string base_path,
+    std::string comm_id,
+    bool load_cached_kernels,
+    std::string cuda_home,
+    std::string rdma_include_dir,
+    std::string rdma_library_dir):
+node_rank(node_rank), local_rank(local_rank), nvcc_compiler(base_path, comm_id, cuda_home, rdma_include_dir, rdma_library_dir) {
     // Load all cached kernels from the cache directory
     jit_dir = get_jit_dir();
     std::filesystem::create_directories(jit_dir);

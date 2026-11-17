@@ -5,7 +5,8 @@
 #include <cstdint>
 #include <vector>
 #include <pybind11/pybind11.h>
-#include <torch/torch.h>
+// #include <torch/torch.h>
+#include <torch/python.h>
 #include "utils.cuh"
 #include "config.cuh"
 #include "coordinator.cuh"

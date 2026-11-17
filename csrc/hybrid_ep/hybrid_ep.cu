@@ -7,20 +7,13 @@
 #include <functional>
 
 std::string get_comm_id(pybind11::object process_group) {
-  auto torch = pybind11::module_::import("torch");
-  auto torch_distributed = torch.attr("distributed");
-
   // Get the global id of each rank in the process group
   std::vector<int> global_ranks;
-  pybind11::object get_global_rank;
-  if (pybind11::hasattr(torch_distributed, "get_global_rank")) {
-    get_global_rank = torch_distributed.attr("get_global_rank");
-  } 
-  int group_size = process_group.attr("size")().cast<int>();
+  int group_id = process_group.attr("id").cast<int>(); 
+  int group_size = process_group.attr("world_size").cast<int>();
   global_ranks.reserve(group_size);
   for (int i = 0; i < group_size; ++i) {
-    int g = get_global_rank(process_group, i).cast<int>();
-    global_ranks.push_back(g);
+    global_ranks.push_back(group_id);
   }
 
   // Concatenate the global ranks into a string
@@ -44,10 +37,14 @@ HybridEPBuffer::HybridEPBuffer(
   std::string base_path,
   bool load_cached_kernels,
   bool use_shared_buffer,
-  bool enable_custom_allgather
+  bool enable_custom_allgather,
+  std::string cuda_home,
+  std::string rdma_include_dir,
+  std::string rdma_library_dir
 ) : process_group(process_group),
     buffer_config(config),
-    executor(local_rank, node_rank, base_path, get_comm_id(process_group), load_cached_kernels, enable_custom_allgather)
+    executor(local_rank, node_rank, base_path, get_comm_id(process_group), load_cached_kernels, enable_custom_allgather,
+             cuda_home, rdma_include_dir, rdma_library_dir)
 {
     buffer_config.num_of_dispatch_chunks = (buffer_config.max_num_of_tokens_per_rank - 1) / buffer_config.num_of_tokens_per_chunk_dispatch_api + 1;
     buffer_config.num_of_combine_chunks = (buffer_config.max_num_of_tokens_per_rank - 1) / buffer_config.num_of_tokens_per_chunk_combine_api + 1;
@@ -115,10 +112,10 @@ bool HybridEPBuffer::update_buffer(HybridEpConfigInstance config) {
 #endif
   need_reallocate |= allgather_obj.grow_buffer_config(config, buffer_config);
 
-  if(buffer_config.num_of_nodes > 1 && need_reallocate) {
-    TORCH_WARN("Reallocating HybridEP buffers in multi-node mode is very slow; "
-               "adjust buffer_config to pre-allocate sufficient capacity.");
-  }
+  // if(buffer_config.num_of_nodes > 1 && need_reallocate) {
+  //   TORCH_WARN("Reallocating HybridEP buffers in multi-node mode is very slow; "
+  //              "adjust buffer_config to pre-allocate sufficient capacity.");
+  // }
 
   if(need_reallocate) {
     nvl_coordinator.update_config(buffer_config);
