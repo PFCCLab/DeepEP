@@ -476,19 +476,24 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
                 assert count == ref_count, f'{ref_count=}, {count=}'
 
             # Check the per-source-rank psum appended by the row-form deterministic dispatch.
-            # NOTES: its rows are scale-up-major (`scaleup * num_scaleout_ranks + scaleout`), which is
-            # the transpose of the global rank index, so the reference has to be read through that map
+            # NOTES: which source rank owns which row is a property of the kernel's traversal, so
+            # read it back from the metadata instead of assuming an order here: every block has to
+            # come from a single source rank and to be as long as that rank's reference count.
             num_ranks = buffer.num_ranks
             if len(psum_num_recv_tokens_per_scaleup_rank_list) == 1 + num_scaleup_ranks + num_ranks:
+                row_src_rank_idx = (src_token_global_idx // num_max_tokens_per_rank).tolist()
                 for i in range(num_ranks):
+                    idx = num_scaleup_ranks + i
                     # NOTES: the appended segment is a prefix sum of its own, so its first row has no
                     # predecessor to subtract -- the element just before it is the first segment's total
-                    idx = num_scaleup_ranks + i
-                    count = psum_num_recv_tokens_per_scaleup_rank_list[idx + 1] - (
-                        psum_num_recv_tokens_per_scaleup_rank_list[idx] if i > 0 else 0)
-                    src_rank_idx = (i % num_scaleout_ranks) * num_scaleup_ranks + i // num_scaleout_ranks
-                    ref_count = int(ref_num_recv_tokens_per_rank[src_rank_idx])
-                    assert count == ref_count, f'{i=}, {src_rank_idx=}, {ref_count=}, {count=}'
+                    start = psum_num_recv_tokens_per_scaleup_rank_list[idx] if i > 0 else 0
+                    end = psum_num_recv_tokens_per_scaleup_rank_list[idx + 1]
+                    block = set(row_src_rank_idx[start:end])
+                    assert len(block) <= 1, f'{i=}, block spans source ranks {sorted(block)}'
+                    if block:
+                        src_rank_idx = block.pop()
+                        ref_count = int(ref_num_recv_tokens_per_rank[src_rank_idx])
+                        assert end - start == ref_count, f'{i=}, {src_rank_idx=}, {ref_count=}, {end - start=}'
 
             # Check dispatch data
             for check_recv_x, check_recv_topk_idx, check_recv_topk_weights, check_handle in (

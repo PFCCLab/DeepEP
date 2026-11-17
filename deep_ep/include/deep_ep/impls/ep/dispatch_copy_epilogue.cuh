@@ -9,10 +9,26 @@
 
 namespace deep_ep::ep {
 
-// `kRowForm` selects the deterministic interpretation of the hybrid scale-up receive buffer:
-// every global source rank owns a private (partially filled) row of `kNumMaxTokensPerRank` slots,
-// so a token sits at `segment = src_scaleup_rank_idx` and
-// `in-segment offset = src_scaleout_rank_idx * kNumMaxTokensPerRank + row-local slot`
+// `kRowForm`: deterministic layout for the hybrid scale-up receive buffer.
+//
+// Layout: global source rank `r` owns a partially filled row of
+// `kNumMaxTokensPerRank` slots in segment `r % kNumScaleupRanks`, starting at
+// in-segment offset `(r / kNumScaleupRanks) * kNumMaxTokensPerRank`.
+// With `r = src_scaleout_rank_idx * kNumScaleupRanks + src_scaleup_rank_idx`, this is
+//   segment = src_scaleup_rank_idx
+//   offset  = src_scaleout_rank_idx * kNumMaxTokensPerRank + row_slot
+//
+// Order: rows are traversed in `r` order, not in buffer-address order, so
+// `recv_x` is sorted by the global source token index.
+//
+// Why: this matches the single-node deterministic path and V1's direct
+// dispatch, preserving bit-exact parity across migration. Expert-weight
+// gradients reduce over tokens in this order. Address-order traversal
+// (e.g. 2x8 rail order 0,8,1,9,...) is also reproducible, but it only
+// permutes whole source-rank blocks and changes the token-dim reduction
+// order, so it is not bitwise-identical.
+//
+// Keep this order.
 template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding, bool kRowForm,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
@@ -97,8 +113,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         int buffer_segment_idx = current_rank_idx;
         int buffer_token_idx = i - current_rank_start;
         if constexpr (kRowForm) {
-            buffer_segment_idx = current_rank_idx / kNumScaleoutRanks;
-            buffer_token_idx = (current_rank_idx % kNumScaleoutRanks) * kNumMaxTokensPerRank + buffer_token_idx;
+            buffer_segment_idx = current_rank_idx % kNumScaleupRanks;
+            buffer_token_idx = (current_rank_idx / kNumScaleupRanks) * kNumMaxTokensPerRank + buffer_token_idx;
         }
         const auto buffer_token = scaleup_buffer.get_rank_buffer(buffer_segment_idx).get_token_buffer(buffer_token_idx);
 
